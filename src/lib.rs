@@ -2,6 +2,7 @@ pub mod cli;
 pub mod walker;
 pub mod formatter;
 pub mod token;
+pub mod tree;
 
 use anyhow::Result;
 use cli::Cli;
@@ -27,7 +28,19 @@ pub fn run(cli: Cli) -> Result<()> {
         selected_files.push((file, tokens));
     }
     
-    let output = formatter::format_files(&selected_files, cli.format)?;
+    let mut output = String::new();
+    
+    // Add tree if requested
+    if cli.tree {
+        let file_paths: Vec<String> = selected_files
+            .iter()
+            .map(|(f, _)| f.path.clone())
+            .collect();
+        output.push_str(&tree::generate_tree(&file_paths));
+    }
+    
+    // Add formatted file contents
+    output.push_str(&formatter::format_files(&selected_files, cli.format)?);
     
     if cli.clipboard {
         #[cfg(not(test))]
@@ -76,5 +89,105 @@ mod tests {
         
         let result = run(cli);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_with_tree_output() {
+        let dir = TempDir::new().unwrap();
+        // Create a nested structure
+        let src_dir = dir.path().join("src");
+        fs::create_dir(&src_dir).unwrap();
+        fs::write(src_dir.join("main.rs"), "fn main() {}").unwrap();
+        fs::write(src_dir.join("lib.rs"), "pub fn foo() {}").unwrap();
+        
+        let tests_dir = dir.path().join("tests");
+        fs::create_dir(&tests_dir).unwrap();
+        fs::write(tests_dir.join("test.rs"), "#[test] fn it_works() {}").unwrap();
+        
+        let output_file = dir.path().join("output.txt");
+        
+        let cli = Cli {
+            path: dir.path().to_path_buf(),
+            include: vec![],
+            exclude: vec![],
+            max_tokens: None,
+            format: formatter::Format::Xml,
+            output: Some(output_file.clone()),
+            clipboard: false,
+            no_gitignore: false,
+            tree: true,
+            stdin_list: false,
+        };
+        
+        let result = run(cli);
+        assert!(result.is_ok());
+        
+        let output_content = fs::read_to_string(&output_file).unwrap();
+        assert!(output_content.contains("Directory structure:"));
+        assert!(output_content.contains("src/"));
+        assert!(output_content.contains("tests/"));
+        assert!(output_content.contains("main.rs"));
+        assert!(output_content.contains("lib.rs"));
+        assert!(output_content.contains("test.rs"));
+        assert!(output_content.contains("<context>"));
+    }
+
+    #[test]
+    fn test_tree_with_max_tokens() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("small.rs"), "fn a() {}").unwrap();
+        fs::write(dir.path().join("large.rs"), "fn b() {}\n".repeat(1000)).unwrap();
+        
+        let output_file = dir.path().join("output.txt");
+        
+        let cli = Cli {
+            path: dir.path().to_path_buf(),
+            include: vec![],
+            exclude: vec![],
+            max_tokens: Some(20),
+            format: formatter::Format::Plain,
+            output: Some(output_file.clone()),
+            clipboard: false,
+            no_gitignore: false,
+            tree: true,
+            stdin_list: false,
+        };
+        
+        run(cli).unwrap();
+        
+        let output_content = fs::read_to_string(&output_file).unwrap();
+        assert!(output_content.contains("Directory structure:"));
+        assert!(output_content.contains("small.rs"));
+        // large.rs should be in tree but not in content due to token limit
+        assert!(output_content.contains("small.rs"));
+    }
+
+    #[test]
+    fn test_tree_markdown_format() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("file1.rs"), "code1").unwrap();
+        fs::write(dir.path().join("file2.rs"), "code2").unwrap();
+        
+        let output_file = dir.path().join("output.md");
+        
+        let cli = Cli {
+            path: dir.path().to_path_buf(),
+            include: vec![],
+            exclude: vec![],
+            max_tokens: None,
+            format: formatter::Format::Md,
+            output: Some(output_file.clone()),
+            clipboard: false,
+            no_gitignore: false,
+            tree: true,
+            stdin_list: false,
+        };
+        
+        run(cli).unwrap();
+        
+        let output_content = fs::read_to_string(&output_file).unwrap();
+        assert!(output_content.contains("Directory structure:"));
+        assert!(output_content.contains("##"));
+        assert!(output_content.contains("```"));
     }
 }
