@@ -22,6 +22,10 @@ pub struct Cli {
     #[arg(short = 'm', long)]
     pub max_tokens: Option<usize>,
 
+    /// Priority strategy when budget is exceeded
+    #[arg(short = 'p', long, default_value = "smallest-first")]
+    pub priority: String,
+
     /// Output format
     #[arg(short = 'f', long, default_value = "xml")]
     pub format: Format,
@@ -45,6 +49,10 @@ pub struct Cli {
     /// Read file paths from stdin instead of walking
     #[arg(long)]
     pub stdin_list: bool,
+
+    /// Show summary of excluded files
+    #[arg(long)]
+    pub show_excluded: bool,
 }
 
 #[cfg(test)]
@@ -61,6 +69,7 @@ mod tests {
         assert_eq!(cli.max_tokens, None);
         assert!(!cli.clipboard);
         assert!(!cli.no_gitignore);
+        assert_eq!(cli.priority, "smallest-first");
     }
 
     #[test]
@@ -71,13 +80,24 @@ mod tests {
             "--include", "*.rs",
             "--exclude", "tests",
             "--max-tokens", "1000",
+            "--priority", "shallow-first",
             "--clipboard"
         ]).unwrap();
         assert_eq!(cli.path, PathBuf::from("src"));
         assert_eq!(cli.include, vec!["*.rs"]);
         assert_eq!(cli.exclude, vec!["tests"]);
         assert_eq!(cli.max_tokens, Some(1000));
+        assert_eq!(cli.priority, "shallow-first");
         assert!(cli.clipboard);
+    }
+
+    #[test]
+    fn test_show_excluded_flag() {
+        let cli = Cli::try_parse_from(&[
+            "cratectx",
+            "--show-excluded"
+        ]).unwrap();
+        assert!(cli.show_excluded);
     }
 
     #[test]
