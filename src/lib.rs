@@ -4,14 +4,39 @@ pub mod formatter;
 pub mod token;
 pub mod tree;
 pub mod budget;
+pub mod dependency;
+pub mod version;
 
 use anyhow::Result;
 use cli::Cli;
 use walker::WalkOptions;
 use budget::PriorityStrategy;
+use std::collections::HashSet;
+
+fn normalize_entry_point(entry_point: &std::path::Path, scan_root: &std::path::Path) -> String {
+    let base = if scan_root.is_absolute() {
+        scan_root.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()).join(scan_root)
+    };
+
+    let absolute_entry = if entry_point.is_absolute() {
+        entry_point.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()).join(entry_point)
+    };
+
+    absolute_entry
+        .strip_prefix(&base)
+        .unwrap_or(entry_point)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
 
 /// Main entry point for the library
 pub fn run(cli: Cli) -> Result<()> {
+    eprintln!("{}", version::app_banner());
+
     let strategy = PriorityStrategy::from_str(&cli.priority)
         .ok_or_else(|| anyhow::anyhow!(
             "Invalid priority strategy: '{}'. Valid options: first-come, smallest-first, shallow-first, deep-first",
@@ -19,7 +44,34 @@ pub fn run(cli: Cli) -> Result<()> {
         ))?;
 
     let walk_opts = WalkOptions::from_cli(&cli);
-    let files = walker::collect_files(&walk_opts)?;
+    let mut files = walker::collect_files(&walk_opts)?;
+
+    if let Some(entry_point) = &cli.entry_point {
+        let entry_point_rel = normalize_entry_point(entry_point, &cli.path);
+
+        if !files.iter().any(|f| f.path == entry_point_rel) {
+            return Err(anyhow::anyhow!(
+                "Entry point '{}' was not found in the scanned files.",
+                entry_point.display()
+            ));
+        }
+
+        let file_data: Vec<(String, String)> = files
+            .iter()
+            .map(|f| (f.path.clone(), f.content.clone()))
+            .collect();
+
+        let graph = dependency::build_dependency_graph(&file_data, &cli.path)?;
+        let mut relevant = HashSet::new();
+        relevant.insert(entry_point_rel.clone());
+        relevant.extend(graph.get_dependencies(&entry_point_rel, cli.dep_depth));
+
+        if cli.with_dependents {
+            relevant.extend(graph.get_dependents(&entry_point_rel, cli.dep_depth));
+        }
+
+        files.retain(|f| relevant.contains(&f.path));
+    }
     
     let budget_result = budget::apply_budget(
         files,
@@ -81,6 +133,14 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn test_entry_point_normalization_for_scan_root() {
+        let scan_root = Path::new("src");
+        let entry = Path::new("src/lib.rs");
+        assert_eq!(normalize_entry_point(entry, scan_root), "lib.rs");
+    }
 
     #[test]
     fn test_basic_run_with_temp_files() {
@@ -101,6 +161,9 @@ mod tests {
             tree: false,
             stdin_list: false,
             show_excluded: false,
+            entry_point: None,
+            dep_depth: 3,
+            with_dependents: false,
         };
         
         let result = run(cli);
@@ -124,6 +187,9 @@ mod tests {
             tree: false,
             stdin_list: false,
             show_excluded: false,
+            entry_point: None,
+            dep_depth: 3,
+            with_dependents: false,
         };
         
         let result = run(cli);
@@ -158,6 +224,9 @@ mod tests {
             tree: true,
             stdin_list: false,
             show_excluded: false,
+            entry_point: None,
+            dep_depth: 3,
+            with_dependents: false,
         };
         
         let result = run(cli);
@@ -194,6 +263,9 @@ mod tests {
             tree: false,
             stdin_list: false,
             show_excluded: false,
+            entry_point: None,
+            dep_depth: 3,
+            with_dependents: false,
         };
         
         run(cli).unwrap();
@@ -224,6 +296,9 @@ mod tests {
             tree: true,
             stdin_list: false,
             show_excluded: false,
+            entry_point: None,
+            dep_depth: 3,
+            with_dependents: false,
         };
         
         run(cli).unwrap();

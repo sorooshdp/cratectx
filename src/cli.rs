@@ -53,6 +53,18 @@ pub struct Cli {
     /// Show summary of excluded files
     #[arg(long)]
     pub show_excluded: bool,
+
+    /// Entry point file for dependency traversal
+    #[arg(long)]
+    pub entry_point: Option<PathBuf>,
+
+    /// Maximum depth for dependency traversal
+    #[arg(long, default_value = "3")]
+    pub dep_depth: usize,
+
+    /// Include reverse dependencies (files that depend on the entry point)
+    #[arg(long)]
+    pub with_dependents: bool,
 }
 
 #[cfg(test)]
@@ -70,6 +82,7 @@ mod tests {
         assert!(!cli.clipboard);
         assert!(!cli.no_gitignore);
         assert_eq!(cli.priority, "smallest-first");
+        assert_eq!(cli.dep_depth, 3);
     }
 
     #[test]
@@ -98,6 +111,19 @@ mod tests {
             "--show-excluded"
         ]).unwrap();
         assert!(cli.show_excluded);
+    }
+
+    #[test]
+    fn test_dependency_options() {
+        let cli = Cli::try_parse_from(&[
+            "cratectx",
+            "--entry-point", "src/main.rs",
+            "--dep-depth", "5",
+            "--with-dependents"
+        ]).unwrap();
+        assert_eq!(cli.entry_point, Some(PathBuf::from("src/main.rs")));
+        assert_eq!(cli.dep_depth, 5);
+        assert!(cli.with_dependents);
     }
 
     #[test]
