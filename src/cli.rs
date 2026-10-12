@@ -127,6 +127,12 @@ mod tests {
     }
 
     #[test]
+    fn test_stdin_list_flag() {
+        let cli = Cli::try_parse_from(&["cratectx", "--stdin-list"]).unwrap();
+        assert!(cli.stdin_list);
+    }
+
+    #[test]
     fn verify_cli() {
         Cli::command().debug_assert();
     }

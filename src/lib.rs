@@ -44,7 +44,11 @@ pub fn run(cli: Cli) -> Result<()> {
         ))?;
 
     let walk_opts = WalkOptions::from_cli(&cli);
-    let mut files = walker::collect_files(&walk_opts)?;
+    let mut files = if cli.stdin_list {
+        walker::collect_files_from_stdin(&walk_opts)?
+    } else {
+        walker::collect_files(&walk_opts)?
+    };
 
     if let Some(entry_point) = &cli.entry_point {
         let entry_point_rel = normalize_entry_point(entry_point, &cli.path);

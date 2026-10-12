@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
 use ignore::{Walk, WalkBuilder};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use crate::cli::Cli;
 
 const MAX_FILE_SIZE: u64 = 500 * 1024; // 500KB
@@ -41,36 +41,102 @@ pub fn collect_files(opts: &WalkOptions) -> Result<Vec<FileEntry>> {
     for result in walker {
         let entry = result.context("Failed to read directory entry")?;
         let path = entry.path();
-
-        if !path.is_file() {
-            continue;
+        match read_file_entry(path, &opts.path, &include) {
+            Ok(Some(file_entry)) => files.push(file_entry),
+            Ok(None) => continue,
+            Err(err) => return Err(err),
         }
-
-        let relative = path.strip_prefix(&opts.path).unwrap_or(path);
-        if !include.matches(relative) {
-            continue;
-        }
-
-        if entry.metadata()?.len() > MAX_FILE_SIZE {
-            eprintln!("Skipping large file: {}", path.display());
-            continue;
-        }
-
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        if is_binary(&bytes) {
-            continue;
-        }
-        let content = String::from_utf8(bytes)
-            .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
-
-        files.push(FileEntry {
-            path: relative.to_string_lossy().into_owned(),
-            content,
-        });
     }
 
     Ok(files)
+}
+
+pub fn parse_stdin_paths(input: &str, root: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for raw in input.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let raw_path = if Path::new(trimmed).is_absolute() {
+            PathBuf::from(trimmed)
+        } else {
+            root.join(trimmed)
+        };
+
+        let normalized = raw_path
+            .components()
+            .filter(|component| !matches!(component, Component::CurDir))
+            .collect::<PathBuf>();
+
+        let key = normalized.to_string_lossy().replace('\\', "/");
+        if seen.insert(key) {
+            entries.push(normalized);
+        }
+    }
+
+    Ok(entries)
+}
+
+pub fn collect_files_from_paths(
+    paths: &[PathBuf],
+    root: &Path,
+    _opts: &WalkOptions,
+) -> Result<Vec<FileEntry>> {
+    let include = IncludeFilter::new(root, &[])?;
+    let mut files = Vec::new();
+
+    for path in paths {
+        if !path.is_file() {
+            return Err(anyhow::anyhow!("File from stdin list was not found: {}", path.display()));
+        }
+
+        match read_file_entry(path, root, &include) {
+            Ok(Some(file_entry)) => files.push(file_entry),
+            Ok(None) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(files)
+}
+
+pub fn collect_files_from_stdin(opts: &WalkOptions) -> Result<Vec<FileEntry>> {
+    let stdin = std::io::read_to_string(std::io::stdin())?;
+    let paths = parse_stdin_paths(&stdin, &opts.path)?;
+    collect_files_from_paths(&paths, &opts.path, opts)
+}
+
+fn read_file_entry(path: &Path, root: &Path, include: &IncludeFilter) -> Result<Option<FileEntry>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    if !include.matches(relative) {
+        return Ok(None);
+    }
+
+    if path.metadata()?.len() > MAX_FILE_SIZE {
+        eprintln!("Skipping large file: {}", path.display());
+        return Ok(None);
+    }
+
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    if is_binary(&bytes) {
+        return Ok(None);
+    }
+    let content = String::from_utf8(bytes)
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+
+    Ok(Some(FileEntry {
+        path: relative.to_string_lossy().replace('\\', "/"),
+        content,
+    }))
 }
 
 /// Excludes are installed as override rules so the walker prunes matching
@@ -257,5 +323,29 @@ mod tests {
         o.include = strings(&["[unclosed"]);
         let err = collect_files(&o).unwrap_err().to_string();
         assert!(err.contains("Invalid include pattern"), "{err}");
+    }
+
+    #[test]
+    fn parse_stdin_paths_handles_relative_and_comment_entries() {
+        let root = Path::new(".");
+        let input = "\n# comment\nsrc/main.rs\n./README.md\n\n";
+        let paths = parse_stdin_paths(input, root).unwrap();
+        assert_eq!(paths, [PathBuf::from("src/main.rs"), PathBuf::from("README.md")]);
+    }
+
+    #[test]
+    fn collect_files_from_stdin_reads_selected_files() {
+        let dir = TempDir::new().unwrap();
+        write(&dir, "src/main.rs", "fn main() {}\n");
+        write(&dir, "src/lib.rs", "pub fn lib() {}\n");
+        write(&dir, "README.md", "# doc\n");
+
+        let root = dir.path();
+        let selected = parse_stdin_paths("src/main.rs\nsrc/lib.rs\nREADME.md\n", root).unwrap();
+        let files = collect_files_from_paths(&selected, root, &opts(&dir)).unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().any(|f| f.path == "src/main.rs"));
+        assert!(files.iter().any(|f| f.path == "src/lib.rs"));
+        assert!(files.iter().any(|f| f.path == "README.md"));
     }
 }

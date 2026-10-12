@@ -21,6 +21,8 @@ cratectx is a Rust CLI tool that scans a codebase and packages selected files in
   - `first-come`
 - Flexible filtering with `--include` and `--exclude`
 - Optional tree preview with `--tree`
+- Dependency-aware entry-point traversal via `--entry-point`
+- Stdin file list selection via `--stdin-list`
 - Output to stdout, a file, or the clipboard
 
 ## Example usage
@@ -31,6 +33,14 @@ cargo run -- . --format xml --max-tokens 5000
 
 ```bash
 cargo run -- src --include "*.rs" --exclude target --tree --format plain
+```
+
+```bash
+cargo run -- src --entry-point src/lib.rs --dep-depth 2 --format plain
+```
+
+```bash
+printf '%s\n' src/lib.rs src/budget.rs | cargo run -- src --stdin-list --format md
 ```
 
 ## CLI options
@@ -47,12 +57,16 @@ cargo run -- src --include "*.rs" --exclude target --tree --format plain
 - `-f, --format <FORMAT>`: output format
   - `xml`
   - `plain`
+  - `md`
 - `-o, --output <FILE>`: write the generated context to a file
 - `-c, --clipboard`: copy the result to the clipboard
 - `--no-gitignore`: disable automatic `.gitignore` respect
 - `-t, --tree`: include a directory tree summary before the file contents
-- `--stdin-list`: read file paths from stdin instead of walking the directory tree
+- `--stdin-list`: read newline-delimited file paths from stdin instead of walking the directory tree
 - `--show-excluded`: print files that were excluded due to the token budget
+- `--entry-point <FILE>`: keep the selected files anchored to a starting file and include its dependency chain
+- `--dep-depth <N>`: maximum depth for dependency traversal (default: `3`)
+- `--with-dependents`: include files that depend on the entry point as well as its dependencies
 
 ## Build
 
