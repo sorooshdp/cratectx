@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
-use ignore::WalkBuilder;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::overrides::OverrideBuilder;
+use ignore::{Walk, WalkBuilder};
 use std::path::{Path, PathBuf};
 use crate::cli::Cli;
 
 const MAX_FILE_SIZE: u64 = 500 * 1024; // 500KB
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
@@ -31,177 +34,228 @@ pub struct FileEntry {
 }
 
 pub fn collect_files(opts: &WalkOptions) -> Result<Vec<FileEntry>> {
-    let mut files = Vec::new();
-    let mut builder = WalkBuilder::new(&opts.path);
-    builder.git_ignore(opts.respect_gitignore);
-    
-    for exclude in &opts.exclude {
-        builder.add_custom_ignore_filename(exclude);
-    }
+    let include = IncludeFilter::new(&opts.path, &opts.include)?;
+    let walker = build_walker(opts)?;
 
-    for result in builder.build() {
+    let mut files = Vec::new();
+    for result in walker {
         let entry = result.context("Failed to read directory entry")?;
         let path = entry.path();
-        
+
         if !path.is_file() {
             continue;
         }
-        
-        if is_binary(path)? {
+
+        let relative = path.strip_prefix(&opts.path).unwrap_or(path);
+        if !include.matches(relative) {
             continue;
         }
-        
-        let metadata = path.metadata()?;
-        if metadata.len() > MAX_FILE_SIZE {
+
+        if entry.metadata()?.len() > MAX_FILE_SIZE {
             eprintln!("Skipping large file: {}", path.display());
             continue;
         }
-        
-        if !opts.include.is_empty() && !matches_patterns(path, &opts.include) {
-            continue;
-        }
-        
-        if matches_patterns(path, &opts.exclude) {
-            continue;
-        }
-        
-        let content = std::fs::read_to_string(path)
+
+        let bytes = std::fs::read(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        
-        let relative_path = path.strip_prefix(&opts.path)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
-        
+        if is_binary(&bytes) {
+            continue;
+        }
+        let content = String::from_utf8(bytes)
+            .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+
         files.push(FileEntry {
-            path: relative_path,
+            path: relative.to_string_lossy().into_owned(),
             content,
         });
     }
-    
+
     Ok(files)
 }
 
-fn is_binary(path: &Path) -> Result<bool> {
-    let content = std::fs::read(path)?;
-    // Simple heuristic: if first 8KB contains null bytes, it's likely binary
-    let sample_size = content.len().min(8192);
-    Ok(content[..sample_size].contains(&0))
+/// Excludes are installed as override rules so the walker prunes matching
+/// directories during traversal instead of visiting (and reading) their contents.
+/// In override syntax a leading `!` means "ignore".
+fn validate_glob_pattern(pattern: &str, label: &str) -> Result<()> {
+    let open = pattern.matches('[').count();
+    let close = pattern.matches(']').count();
+    if open != close {
+        return Err(anyhow::anyhow!("Invalid {label} pattern: {pattern:?}"));
+    }
+    Ok(())
 }
 
-fn matches_patterns(path: &Path, patterns: &[String]) -> bool {
-    use ignore::gitignore::GitignoreBuilder;
-    
-    if patterns.is_empty() {
-        return false;
+fn build_walker(opts: &WalkOptions) -> Result<Walk> {
+    let mut overrides = OverrideBuilder::new(&opts.path);
+    for pattern in &opts.exclude {
+        validate_glob_pattern(pattern, "exclude")?;
+        overrides
+            .add(&format!("!{pattern}"))
+            .with_context(|| format!("Invalid exclude pattern: {pattern:?}"))?;
     }
-    
-    let mut builder = GitignoreBuilder::new("");
-    for pattern in patterns {
-        builder.add_line(None, pattern).ok();
+    let overrides = overrides.build().context("Failed to compile exclude patterns")?;
+
+    let mut builder = WalkBuilder::new(&opts.path);
+    builder
+        .overrides(overrides)
+        .git_ignore(opts.respect_gitignore)
+        .git_global(opts.respect_gitignore)
+        .git_exclude(opts.respect_gitignore)
+        .require_git(false);
+
+    Ok(builder.build())
+}
+
+/// Include patterns are applied as a post-filter on files, not as override
+/// whitelists. A whitelist override takes precedence over `.gitignore` and
+/// would resurrect ignored files whenever `--include` is used; that is not
+/// what `--include "*.rs"` should mean. Since an include pattern can never
+/// prune a directory, filtering after the walk costs nothing extra.
+struct IncludeFilter(Option<Gitignore>);
+
+impl IncludeFilter {
+    fn new(root: &Path, patterns: &[String]) -> Result<Self> {
+        if patterns.is_empty() {
+            return Ok(Self(None));
+        }
+        let mut builder = GitignoreBuilder::new(root);
+        for pattern in patterns {
+            validate_glob_pattern(pattern, "include")?;
+            builder
+                .add_line(None, pattern)
+                .with_context(|| format!("Invalid include pattern: {pattern:?}"))?;
+        }
+        let matcher = builder.build().context("Failed to compile include patterns")?;
+        Ok(Self(Some(matcher)))
     }
-    
-    if let Ok(gi) = builder.build() {
-        gi.matched(path, false).is_ignore()
-    } else {
-        false
+
+    /// `relative` must be relative to the scan root. A file matches if it or
+    /// any parent directory matches a pattern, so `--include src` selects
+    /// everything under `src/`.
+    fn matches(&self, relative: &Path) -> bool {
+        match &self.0 {
+            None => true,
+            Some(gi) => gi.matched_path_or_any_parents(relative, false).is_ignore(),
+        }
     }
+}
+
+/// Heuristic: a NUL byte in the first 8KB means binary.
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
-    #[test]
-    fn test_collect_files_empty_dir() {
-        let dir = TempDir::new().unwrap();
-        let opts = WalkOptions {
+    fn opts(dir: &TempDir) -> WalkOptions {
+        WalkOptions {
             path: dir.path().to_path_buf(),
             include: vec![],
             exclude: vec![],
             respect_gitignore: true,
-        };
-        
-        let files = collect_files(&opts).unwrap();
-        assert_eq!(files.len(), 0);
+        }
+    }
+
+    fn write(dir: &TempDir, rel: &str, content: impl AsRef<[u8]>) {
+        let path = dir.path().join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    fn paths(files: &[FileEntry]) -> Vec<String> {
+        let mut v: Vec<_> = files.iter().map(|f| f.path.replace('\\', "/")).collect();
+        v.sort();
+        v
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn test_collect_files_with_content() {
+    fn collects_text_files_and_skips_binary() {
         let dir = TempDir::new().unwrap();
-        let file1 = dir.path().join("test1.rs");
-        let file2 = dir.path().join("test2.rs");
-        fs::write(&file1, "fn foo() {}").unwrap();
-        fs::write(&file2, "fn bar() {}").unwrap();
-        
-        let opts = WalkOptions {
-            path: dir.path().to_path_buf(),
-            include: vec![],
-            exclude: vec![],
-            respect_gitignore: true,
-        };
-        
-        let files = collect_files(&opts).unwrap();
-        assert_eq!(files.len(), 2);
+        write(&dir, "a.rs", "fn a() {}");
+        write(&dir, "b.txt", "hello");
+        write(&dir, "blob.bin", [0u8, 1, 2, 0, 255]);
+
+        let files = collect_files(&opts(&dir)).unwrap();
+        assert_eq!(paths(&files), ["a.rs", "b.txt"]);
+    }
+
+    /// Regression: a bare directory name never matched the old per-file matcher,
+    /// so `--exclude target` still included everything under `target/`.
+    #[test]
+    fn exclude_prunes_directories_and_files() {
+        let dir = TempDir::new().unwrap();
+        write(&dir, "src/main.rs", "fn main() {}");
+        write(&dir, "target/debug/build.rs", "// generated");
+        write(&dir, "notes.txt", "todo");
+
+        let mut o = opts(&dir);
+        o.exclude = strings(&["target", "*.txt"]);
+
+        let files = collect_files(&o).unwrap();
+        assert_eq!(paths(&files), ["src/main.rs"]);
     }
 
     #[test]
-    fn test_exclude_pattern() {
+    fn include_matches_files_and_whole_directories() {
         let dir = TempDir::new().unwrap();
-        let file1 = dir.path().join("test.rs");
-        let file2 = dir.path().join("test.txt");
-        fs::write(&file1, "fn foo() {}").unwrap();
-        fs::write(&file2, "hello").unwrap();
-        
-        let opts = WalkOptions {
-            path: dir.path().to_path_buf(),
-            include: vec![],
-            exclude: vec!["*.txt".to_string()],
-            respect_gitignore: true,
-        };
-        
-        let files = collect_files(&opts).unwrap();
-        assert_eq!(files.len(), 1);
-        assert!(files[0].path.ends_with(".rs"));
+        write(&dir, "src/main.rs", "fn main() {}");
+        write(&dir, "src/util/helper.rs", "pub fn h() {}");
+        write(&dir, "docs/guide.md", "# guide");
+        write(&dir, "README.md", "# readme");
+        write(&dir, "build.py", "print()");
+
+        let mut o = opts(&dir);
+        o.include = strings(&["src", "*.md"]);
+
+        let files = collect_files(&o).unwrap();
+        assert_eq!(
+            paths(&files),
+            ["README.md", "docs/guide.md", "src/main.rs", "src/util/helper.rs"]
+        );
+    }
+
+    /// Documents the design choice: includes narrow the selection but do not
+    /// override `.gitignore`. Also covers `require_git(false)` (no repo here)
+    /// and the `respect_gitignore` switch.
+    #[test]
+    fn include_does_not_override_gitignore() {
+        let dir = TempDir::new().unwrap();
+        write(&dir, ".gitignore", "generated.rs\n");
+        write(&dir, "main.rs", "fn main() {}");
+        write(&dir, "generated.rs", "// generated");
+
+        let mut o = opts(&dir);
+        o.include = strings(&["*.rs"]);
+
+        let files = collect_files(&o).unwrap();
+        assert_eq!(paths(&files), ["main.rs"]);
+
+        o.respect_gitignore = false;
+        let files = collect_files(&o).unwrap();
+        assert_eq!(paths(&files), ["generated.rs", "main.rs"]);
     }
 
     #[test]
-    fn test_include_pattern() {
+    fn invalid_glob_is_an_error() {
         let dir = TempDir::new().unwrap();
-        let file1 = dir.path().join("test.rs");
-        let file2 = dir.path().join("test.txt");
-        fs::write(&file1, "fn foo() {}").unwrap();
-        fs::write(&file2, "hello").unwrap();
-        
-        let opts = WalkOptions {
-            path: dir.path().to_path_buf(),
-            include: vec!["*.rs".to_string()],
-            exclude: vec![],
-            respect_gitignore: true,
-        };
-        
-        let files = collect_files(&opts).unwrap();
-        assert_eq!(files.len(), 1);
-        assert!(files[0].path.ends_with(".rs"));
-    }
+        write(&dir, "a.rs", "");
 
-    #[test]
-    fn test_is_binary_detects_null_bytes() {
-        let dir = TempDir::new().unwrap();
-        let binary_file = dir.path().join("binary");
-        fs::write(&binary_file, vec![0u8, 1, 2, 0, 255]).unwrap();
-        
-        assert!(is_binary(&binary_file).unwrap());
-    }
+        let mut o = opts(&dir);
+        o.exclude = strings(&["[unclosed"]);
+        let err = collect_files(&o).unwrap_err().to_string();
+        assert!(err.contains("Invalid exclude pattern"), "{err}");
 
-    #[test]
-    fn test_is_binary_rejects_text() {
-        let dir = TempDir::new().unwrap();
-        let text_file = dir.path().join("text.txt");
-        fs::write(&text_file, "hello world").unwrap();
-        
-        assert!(!is_binary(&text_file).unwrap());
+        let mut o = opts(&dir);
+        o.include = strings(&["[unclosed"]);
+        let err = collect_files(&o).unwrap_err().to_string();
+        assert!(err.contains("Invalid include pattern"), "{err}");
     }
 }
