@@ -11,6 +11,30 @@ use std::sync::Mutex;
 const MAX_FILE_SIZE: u64 = 500 * 1024; // 500KB
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
+const DEFAULT_EXCLUDES: &[&str] = &[
+    "Cargo.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "poetry.lock",
+    "uv.lock",
+    "Gemfile.lock",
+    "composer.lock",
+    "*.min.js",
+    "*.min.css",
+    "*.map",
+];
+
+/// Normalizes user glob patterns so `./target`, `.\target\`, and `.\src\*.rs`
+/// work consistently across Windows PowerShell and Unix shells.
+pub fn normalize_glob_pattern(pattern: &str) -> String {
+    let mut normalized = pattern.trim().replace('\\', "/");
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped.to_string();
+    }
+    normalized
+}
+
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
     pub path: PathBuf,
@@ -18,6 +42,7 @@ pub struct WalkOptions {
     pub exclude: Vec<String>,
     pub respect_gitignore: bool,
     pub redact_secrets: bool,
+    pub default_excludes: bool,
 }
 
 impl WalkOptions {
@@ -28,6 +53,7 @@ impl WalkOptions {
             exclude: cli.exclude.clone(),
             respect_gitignore: !cli.no_gitignore,
             redact_secrets: !cli.no_redact,
+            default_excludes: !cli.no_default_excludes,
         }
     }
 }
@@ -44,6 +70,7 @@ pub fn collect_files(opts: &WalkOptions) -> Result<Vec<FileEntry>> {
 
     let files: Mutex<Vec<FileEntry>> = Mutex::new(Vec::new());
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let redact = opts.redact_secrets;
 
     walker.run(|| {
         let files = &files;
@@ -70,7 +97,7 @@ pub fn collect_files(opts: &WalkOptions) -> Result<Vec<FileEntry>> {
                 }
             }
 
-            match read_file_entry(entry.path(), root, include) {
+            match read_file_entry(entry.path(), root, include, redact) {
                 Ok(Some(file_entry)) => {
                     files.lock().unwrap().push(file_entry);
                     WalkState::Continue
@@ -164,7 +191,7 @@ pub fn parse_stdin_paths(input: &str, root: &Path) -> Result<Vec<PathBuf>> {
 pub fn collect_files_from_paths(
     paths: &[PathBuf],
     root: &Path,
-    _opts: &WalkOptions,
+    opts: &WalkOptions,
 ) -> Result<Vec<FileEntry>> {
     let include = IncludeFilter::new(root, &[])?;
     let mut files = Vec::with_capacity(paths.len());
@@ -177,7 +204,7 @@ pub fn collect_files_from_paths(
             ));
         }
 
-        match read_file_entry(path, root, &include) {
+        match read_file_entry(path, root, &include, opts.redact_secrets) {
             Ok(Some(file_entry)) => files.push(file_entry),
             Ok(None) => continue,
             Err(err) => return Err(err),
@@ -193,7 +220,12 @@ pub fn collect_files_from_stdin(opts: &WalkOptions) -> Result<Vec<FileEntry>> {
     collect_files_from_paths(&paths, &opts.path, opts)
 }
 
-fn read_file_entry(path: &Path, root: &Path, include: &IncludeFilter) -> Result<Option<FileEntry>> {
+fn read_file_entry(
+    path: &Path,
+    root: &Path,
+    include: &IncludeFilter,
+    redact: bool,
+) -> Result<Option<FileEntry>> {
     let relative = path.strip_prefix(root).unwrap_or(path);
     // Filter by include glob BEFORE making filesystem metadata syscalls
     if !include.matches(relative) {
@@ -263,11 +295,22 @@ fn validate_glob_pattern(pattern: &str, label: &str) -> Result<()> {
 
 fn build_parallel_walker(opts: &WalkOptions) -> Result<WalkParallel> {
     let mut overrides = OverrideBuilder::new(&opts.path);
-    for pattern in &opts.exclude {
-        validate_glob_pattern(pattern, "exclude")?;
+
+    if opts.default_excludes {
+        for &default_pat in DEFAULT_EXCLUDES {
+            overrides.add(&format!("!{default_pat}"))?;
+        }
+    }
+
+    for raw_pattern in &opts.exclude {
+        let pattern = normalize_glob_pattern(raw_pattern);
+        if pattern.is_empty() {
+            continue;
+        }
+        validate_glob_pattern(&pattern, "exclude")?;
         overrides
             .add(&format!("!{pattern}"))
-            .with_context(|| format!("Invalid exclude pattern: {pattern:?}"))?;
+            .with_context(|| format!("Invalid exclude pattern: {raw_pattern:?}"))?;
     }
     let overrides = overrides
         .build()
@@ -276,6 +319,7 @@ fn build_parallel_walker(opts: &WalkOptions) -> Result<WalkParallel> {
     let mut builder = WalkBuilder::new(&opts.path);
     builder
         .overrides(overrides)
+        .add_custom_ignore_filename(".cratectxignore")
         .git_ignore(opts.respect_gitignore)
         .git_global(opts.respect_gitignore)
         .git_exclude(opts.respect_gitignore)
@@ -292,11 +336,15 @@ impl IncludeFilter {
             return Ok(Self(None));
         }
         let mut builder = GitignoreBuilder::new(root);
-        for pattern in patterns {
-            validate_glob_pattern(pattern, "include")?;
+        for raw_pattern in patterns {
+            let pattern = normalize_glob_pattern(raw_pattern);
+            if pattern.is_empty() {
+                continue;
+            }
+            validate_glob_pattern(&pattern, "include")?;
             builder
-                .add_line(None, pattern)
-                .with_context(|| format!("Invalid include pattern: {pattern:?}"))?;
+                .add_line(None, &pattern)
+                .with_context(|| format!("Invalid include pattern: {raw_pattern:?}"))?;
         }
         let matcher = builder
             .build()
@@ -324,7 +372,10 @@ pub fn redact_secrets(input: &str) -> String {
 
     // 1. Redact PEM private key blocks
     while let Some(start) = text.find("-----BEGIN ") {
-        let header_end = text[start..].find("-----").map(|i| start + i + 5);
+        let after_begin = start + 11;
+        let header_end = text[after_begin..]
+            .find("-----")
+            .map(|i| after_begin + i + 5);
         if let Some(h_end) = header_end {
             if text[start..h_end].contains("PRIVATE KEY") {
                 if let Some(end_marker) = text[h_end..].find("-----END ") {
@@ -414,6 +465,7 @@ mod tests {
             exclude: vec![],
             respect_gitignore: true,
             redact_secrets: true,
+            default_excludes: true,
         }
     }
 
@@ -574,5 +626,33 @@ mod tests {
         assert!(clean.contains("[REDACTED_PRIVATE_KEY]"));
         assert!(!clean.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(!clean.contains("MIIEpAIBAAKCAQEA"));
+    }
+
+    #[test]
+    fn exclude_handles_dot_slash_and_windows_backslashes() {
+        let dir = TempDir::new().unwrap();
+        write(&dir, "src/main.rs", "fn main() {}");
+        write(&dir, "target/debug/app.rs", "// build artifact");
+        write(&dir, "docs/readme.md", "# docs");
+        write(&dir, "config.yaml", "key: val");
+
+        let mut o = opts(&dir);
+        o.exclude = strings(&["./target", ".\\docs\\", "*.yaml"]);
+
+        let files = collect_files(&o).unwrap();
+        assert_eq!(paths(&files), ["src/main.rs"]);
+    }
+
+    #[test]
+    fn default_excludes_skip_cargo_lock_and_respect_cratectxignore() {
+        let dir = TempDir::new().unwrap();
+        write(&dir, "src/lib.rs", "pub fn a() {}");
+        write(&dir, "Cargo.lock", "# lockfile");
+        write(&dir, "bundle.min.js", "function(){}");
+        write(&dir, "scratch.txt", "ignore me");
+        write(&dir, ".cratectxignore", "scratch.txt\n");
+
+        let files = collect_files(&opts(&dir)).unwrap();
+        assert_eq!(paths(&files), ["src/lib.rs"]);
     }
 }
