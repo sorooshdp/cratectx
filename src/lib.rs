@@ -91,23 +91,6 @@ pub fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    // Reserve token budget for directory tree if both --tree and --max-tokens are active
-    let effective_max_tokens = match (cli.max_tokens, cli.tree) {
-        (Some(max), true) => {
-            let preview_paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-            let tree_tokens = token::estimate_tokens(&tree::generate_tree(&preview_paths));
-            Some(max.saturating_sub(tree_tokens))
-        }
-        (max, _) => max,
-    };
-
-    let budget_result = budget::apply_budget(
-        files,
-        effective_max_tokens,
-        strategy,
-        token::estimate_tokens,
-    );
-
     let budget_result =
         budget::apply_budget(files, cli.max_tokens, strategy, token::estimate_tokens);
 
@@ -121,6 +104,28 @@ pub fn run(cli: Cli) -> Result<()> {
         eprintln!(
             "Excluded {} file(s) due to token budget. Use --show-excluded to see the list.",
             budget_result.excluded.len()
+        );
+    }
+
+    if !budget_result.included.is_empty() {
+        let mut top: Vec<(&str, usize)> = budget_result
+            .included
+            .iter()
+            .map(|(f, t)| (f.path.as_str(), *t))
+            .collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let top_summary: Vec<String> = top
+            .into_iter()
+            .take(3)
+            .map(|(p, t)| format!("{p} ({t})"))
+            .collect();
+
+        eprintln!(
+            "Packed {} file(s) ({} tokens total) | Largest: {}",
+            budget_result.included.len(),
+            budget_result.total_tokens,
+            top_summary.join(", ")
         );
     }
 
@@ -194,6 +199,7 @@ mod tests {
             strip_tests: false,
             signatures_only: false,
             no_redact: false,
+            no_default_excludes: false,
         }
     }
 
@@ -210,26 +216,8 @@ mod tests {
         let file1 = dir.path().join("test.rs");
         fs::write(&file1, "fn main() {}").unwrap();
 
-        let cli = Cli {
-            path: dir.path().to_path_buf(),
-            include: vec![],
-            exclude: vec![],
-            max_tokens: None,
-            priority: "smallest-first".to_string(),
-            format: formatter::Format::Xml,
-            output: None,
-            clipboard: false,
-            no_gitignore: false,
-            tree: false,
-            stdin_list: false,
-            show_excluded: false,
-            entry_point: None,
-            dep_depth: 3,
-            with_dependents: false,
-            strip_tests: false,
-            signatures_only: false,
-            no_redact: false,
-        };
+        let mut cli = default_test_cli(dir.path().to_path_buf());
+        cli.output = Some(dir.path().join("out.xml"));
 
         let result = run(cli);
         assert!(result.is_ok());
@@ -239,26 +227,8 @@ mod tests {
     fn test_invalid_priority_strategy() {
         let dir = TempDir::new().unwrap();
 
-        let cli = Cli {
-            path: dir.path().to_path_buf(),
-            include: vec![],
-            exclude: vec![],
-            max_tokens: None,
-            priority: "invalid-strategy".to_string(),
-            format: formatter::Format::Xml,
-            output: None,
-            clipboard: false,
-            no_gitignore: false,
-            tree: false,
-            stdin_list: false,
-            show_excluded: false,
-            entry_point: None,
-            dep_depth: 3,
-            with_dependents: false,
-            strip_tests: false,
-            signatures_only: false,
-            no_redact: false,
-        };
+        let mut cli = default_test_cli(dir.path().to_path_buf());
+        cli.priority = "invalid-strategy".to_string();
 
         let result = run(cli);
         assert!(result.is_err());
@@ -284,26 +254,9 @@ mod tests {
 
         let output_file = dir.path().join("output.txt");
 
-        let cli = Cli {
-            path: dir.path().to_path_buf(),
-            include: vec![],
-            exclude: vec![],
-            max_tokens: None,
-            priority: "smallest-first".to_string(),
-            format: formatter::Format::Xml,
-            output: Some(output_file.clone()),
-            clipboard: false,
-            no_gitignore: false,
-            tree: true,
-            stdin_list: false,
-            show_excluded: false,
-            entry_point: None,
-            dep_depth: 3,
-            with_dependents: false,
-            strip_tests: false,
-            signatures_only: false,
-            no_redact: false,
-        };
+        let mut cli = default_test_cli(dir.path().to_path_buf());
+        cli.output = Some(output_file.clone());
+        cli.tree = true;
 
         let result = run(cli);
         assert!(result.is_ok());
@@ -326,26 +279,10 @@ mod tests {
 
         let output_file = dir.path().join("output.txt");
 
-        let cli = Cli {
-            path: dir.path().to_path_buf(),
-            include: vec![],
-            exclude: vec![],
-            max_tokens: Some(10),
-            priority: "smallest-first".to_string(),
-            format: formatter::Format::Plain,
-            output: Some(output_file.clone()),
-            clipboard: false,
-            no_gitignore: false,
-            tree: false,
-            stdin_list: false,
-            show_excluded: false,
-            entry_point: None,
-            dep_depth: 3,
-            with_dependents: false,
-            strip_tests: false,
-            signatures_only: false,
-            no_redact: false,
-        };
+        let mut cli = default_test_cli(dir.path().to_path_buf());
+        cli.max_tokens = Some(10);
+        cli.format = formatter::Format::Plain;
+        cli.output = Some(output_file.clone());
 
         run(cli).unwrap();
 
@@ -362,26 +299,11 @@ mod tests {
 
         let output_file = dir.path().join("output.txt");
 
-        let cli = Cli {
-            path: dir.path().to_path_buf(),
-            include: vec![],
-            exclude: vec![],
-            max_tokens: Some(10),
-            priority: "smallest-first".to_string(),
-            format: formatter::Format::Plain,
-            output: Some(output_file.clone()),
-            clipboard: false,
-            no_gitignore: false,
-            tree: true,
-            stdin_list: false,
-            show_excluded: false,
-            entry_point: None,
-            dep_depth: 3,
-            with_dependents: false,
-            strip_tests: false,
-            signatures_only: false,
-            no_redact: false,
-        };
+        let mut cli = default_test_cli(dir.path().to_path_buf());
+        cli.max_tokens = Some(15);
+        cli.format = formatter::Format::Plain;
+        cli.output = Some(output_file.clone());
+        cli.tree = true;
 
         run(cli).unwrap();
 
