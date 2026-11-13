@@ -3,53 +3,56 @@ use std::fmt::Write;
 use std::path::{Component, Path};
 
 /// Generate a tree-style directory structure from file paths.
-pub fn generate_tree(file_paths: &[String]) -> String {
+pub fn generate_tree<S: AsRef<str>>(file_paths: &[S]) -> String {
     if file_paths.is_empty() {
         return String::new();
     }
 
     let mut root = Node::default();
     for path in file_paths {
-        root.insert(path);
+        root.insert(path.as_ref());
     }
 
-    let mut out = String::from("Directory structure:\n");
-    render(&root, "", &mut out);
+    // Pre-allocate approximately 32 bytes per path entry
+    let mut out = String::with_capacity(24 + file_paths.len() * 32);
+    out.push_str("Directory structure:\n");
+
+    let mut prefix = String::with_capacity(64);
+    render(&root, &mut prefix, &mut out);
     out.push('\n');
     out
 }
 
 #[derive(Debug, Default)]
-struct Node {
-    dirs: BTreeMap<String, Node>,
-    files: BTreeSet<String>,
+struct Node<'a> {
+    dirs: BTreeMap<&'a str, Node<'a>>,
+    files: BTreeSet<&'a str>,
 }
 
-impl Node {
-    fn insert(&mut self, path: &str) {
-        // Only keep normal components: drops `.`, `..`, and any root prefix.
-        let parts: Vec<String> = Path::new(path)
+impl<'a> Node<'a> {
+    fn insert(&mut self, path: &'a str) {
+        let mut components = Path::new(path)
             .components()
             .filter_map(|c| match c {
-                Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                Component::Normal(s) => s.to_str(),
                 _ => None,
             })
-            .collect();
-
-        let Some((file, dirs)) = parts.split_last() else {
-            return;
-        };
+            .peekable();
 
         let mut node = self;
-        for dir in dirs {
-            node = node.dirs.entry(dir.clone()).or_default();
+        while let Some(part) = components.next() {
+            if components.peek().is_some() {
+                node = node.dirs.entry(part).or_default();
+            } else {
+                node.files.insert(part);
+            }
         }
-        node.files.insert(file.clone());
     }
 }
 
 /// Renders directories first, then files, each group sorted by name.
-fn render(node: &Node, prefix: &str, out: &mut String) {
+/// Reuses `prefix` buffer across recursive calls to avoid per-level String allocations.
+fn render(node: &Node<'_>, prefix: &mut String, out: &mut String) {
     let total = node.dirs.len() + node.files.len();
     let mut index = 0;
 
@@ -59,8 +62,11 @@ fn render(node: &Node, prefix: &str, out: &mut String) {
         index += 1;
         let is_last = index == total;
         let _ = writeln!(out, "{prefix}{} {name}/", connector(is_last));
-        let child_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
-        render(child, &child_prefix, out);
+
+        let prev_len = prefix.len();
+        prefix.push_str(if is_last { "    " } else { "│   " });
+        render(child, prefix, out);
+        prefix.truncate(prev_len);
     }
 
     for name in &node.files {
@@ -74,7 +80,7 @@ mod tests {
     use super::*;
 
     fn tree(paths: &[&str]) -> String {
-        generate_tree(&paths.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        generate_tree(paths)
     }
 
     #[test]
@@ -82,8 +88,13 @@ mod tests {
         assert_eq!(tree(&[]), "");
     }
 
-    /// Regression: intermediate directories that contain no files of their own
-    /// used to be invisible to the renderer, so this path produced no output at all.
+    #[test]
+    fn works_with_owned_strings_and_str_slices() {
+        let owned = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
+        let borrowed = ["src/main.rs", "src/lib.rs"];
+        assert_eq!(generate_tree(&owned), generate_tree(&borrowed));
+    }
+
     #[test]
     fn renders_files_nested_under_empty_intermediate_dirs() {
         let expected = "\

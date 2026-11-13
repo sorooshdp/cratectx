@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use crate::walker::FileEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,12 +15,25 @@ pub enum PriorityStrategy {
 
 impl PriorityStrategy {
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "first-come" | "firstcome" => Some(Self::FirstCome),
-            "smallest-first" | "smallestfirst" | "smallest" => Some(Self::SmallestFirst),
-            "shallow-first" | "shallowfirst" | "shallow" => Some(Self::ShallowFirst),
-            "deep-first" | "deepfirst" | "deep" => Some(Self::DeepFirst),
-            _ => None,
+        if s.eq_ignore_ascii_case("first-come") || s.eq_ignore_ascii_case("firstcome") {
+            Some(Self::FirstCome)
+        } else if s.eq_ignore_ascii_case("smallest-first")
+            || s.eq_ignore_ascii_case("smallestfirst")
+            || s.eq_ignore_ascii_case("smallest")
+        {
+            Some(Self::SmallestFirst)
+        } else if s.eq_ignore_ascii_case("shallow-first")
+            || s.eq_ignore_ascii_case("shallowfirst")
+            || s.eq_ignore_ascii_case("shallow")
+        {
+            Some(Self::ShallowFirst)
+        } else if s.eq_ignore_ascii_case("deep-first")
+            || s.eq_ignore_ascii_case("deepfirst")
+            || s.eq_ignore_ascii_case("deep")
+        {
+            Some(Self::DeepFirst)
+        } else {
+            None
         }
     }
 }
@@ -29,6 +43,11 @@ pub struct BudgetResult {
     pub included: Vec<(FileEntry, usize)>,
     pub excluded: Vec<FileEntry>,
     pub total_tokens: usize,
+}
+
+#[inline]
+fn path_depth(path: &str) -> usize {
+    path.bytes().filter(|&b| b == b'/' || b == b'\\').count()
 }
 
 /// Apply token budget with prioritization strategy
@@ -46,37 +65,27 @@ pub fn apply_budget(
         })
         .collect();
 
-    // Sort by priority strategy
+    // Sort by priority strategy using O(N) cached keys
     match strategy {
-        PriorityStrategy::FirstCome => {
-            // Keep original order
-        }
+        PriorityStrategy::FirstCome => {}
         PriorityStrategy::SmallestFirst => {
-            file_tokens.sort_by(|a, b| a.1.cmp(&b.1));
+            file_tokens.sort_by_key(|&(_, tokens)| tokens);
         }
         PriorityStrategy::ShallowFirst => {
-            file_tokens.sort_by(|a, b| {
-                let depth_a = a.0.path.matches('/').count() + a.0.path.matches('\\').count();
-                let depth_b = b.0.path.matches('/').count() + b.0.path.matches('\\').count();
-                depth_a.cmp(&depth_b)
-            });
+            file_tokens.sort_by_cached_key(|(f, _)| path_depth(&f.path));
         }
         PriorityStrategy::DeepFirst => {
-            file_tokens.sort_by(|a, b| {
-                let depth_a = a.0.path.matches('/').count() + a.0.path.matches('\\').count();
-                let depth_b = b.0.path.matches('/').count() + b.0.path.matches('\\').count();
-                depth_b.cmp(&depth_a)
-            });
+            file_tokens.sort_by_cached_key(|(f, _)| Reverse(path_depth(&f.path)));
         }
     }
 
-    let mut included = Vec::new();
+    let mut included = Vec::with_capacity(file_tokens.len());
     let mut excluded = Vec::new();
-    let mut total_tokens = 0;
+    let mut total_tokens: usize = 0;
 
     if let Some(max) = max_tokens {
         for (file, tokens) in file_tokens {
-            if total_tokens + tokens <= max {
+            if total_tokens.saturating_add(tokens) <= max {
                 total_tokens += tokens;
                 included.push((file, tokens));
             } else {
@@ -84,7 +93,6 @@ pub fn apply_budget(
             }
         }
     } else {
-        // No budget limit, include everything
         for (file, tokens) in file_tokens {
             total_tokens += tokens;
             included.push((file, tokens));
@@ -110,7 +118,7 @@ mod tests {
     }
 
     fn simple_estimator(content: &str) -> usize {
-        (content.len() as f64 / 4.0).ceil() as usize
+        content.len().div_ceil(4)
     }
 
     #[test]
@@ -121,12 +129,7 @@ mod tests {
             make_file("c.rs", "very long content here"),
         ];
 
-        let result = apply_budget(
-            files,
-            None,
-            PriorityStrategy::FirstCome,
-            simple_estimator,
-        );
+        let result = apply_budget(files, None, PriorityStrategy::FirstCome, simple_estimator);
 
         assert_eq!(result.included.len(), 3);
         assert_eq!(result.excluded.len(), 0);
@@ -147,7 +150,6 @@ mod tests {
             simple_estimator,
         );
 
-        // large.rs (25 tokens) + small.rs (1 token) = 26 tokens
         assert_eq!(result.included.len(), 2);
         assert_eq!(result.included[0].0.path, "large.rs");
         assert_eq!(result.included[1].0.path, "small.rs");
@@ -170,7 +172,6 @@ mod tests {
             simple_estimator,
         );
 
-        // small.rs (1) + medium.rs (13) + large.rs (25) = 39, so only first two fit
         assert_eq!(result.included.len(), 2);
         assert_eq!(result.included[0].0.path, "small.rs");
         assert_eq!(result.included[1].0.path, "medium.rs");
@@ -193,7 +194,6 @@ mod tests {
             simple_estimator,
         );
 
-        // root.rs (5) + a/mid.rs (5) = 10 tokens
         assert_eq!(result.included.len(), 2);
         assert_eq!(result.included[0].0.path, "root.rs");
         assert_eq!(result.included[1].0.path, "a/mid.rs");
@@ -215,7 +215,6 @@ mod tests {
             simple_estimator,
         );
 
-        // a/b/c/deep.rs (5) + a/mid.rs (5) = 10 tokens
         assert_eq!(result.included.len(), 2);
         assert_eq!(result.included[0].0.path, "a/b/c/deep.rs");
         assert_eq!(result.included[1].0.path, "a/mid.rs");
@@ -224,17 +223,9 @@ mod tests {
 
     #[test]
     fn test_exact_budget_fit() {
-        let files = vec![
-            make_file("a.rs", "xxxx"), // 1 token
-            make_file("b.rs", "xxxx"), // 1 token
-        ];
+        let files = vec![make_file("a.rs", "xxxx"), make_file("b.rs", "xxxx")];
 
-        let result = apply_budget(
-            files,
-            Some(2),
-            PriorityStrategy::FirstCome,
-            simple_estimator,
-        );
+        let result = apply_budget(files, Some(2), PriorityStrategy::FirstCome, simple_estimator);
 
         assert_eq!(result.included.len(), 2);
         assert_eq!(result.total_tokens, 2);
@@ -263,7 +254,7 @@ mod tests {
             Some(PriorityStrategy::FirstCome)
         );
         assert_eq!(
-            PriorityStrategy::from_str("smallest-first"),
+            PriorityStrategy::from_str("SMALLEST-FIRST"),
             Some(PriorityStrategy::SmallestFirst)
         );
         assert_eq!(

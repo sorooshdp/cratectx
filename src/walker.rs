@@ -1,9 +1,12 @@
+use crate::cli::Cli;
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
-use ignore::{Walk, WalkBuilder};
+use ignore::{WalkBuilder, WalkParallel, WalkState};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use crate::cli::Cli;
+use std::sync::Mutex;
 
 const MAX_FILE_SIZE: u64 = 500 * 1024; // 500KB
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
@@ -35,20 +38,61 @@ pub struct FileEntry {
 
 pub fn collect_files(opts: &WalkOptions) -> Result<Vec<FileEntry>> {
     let include = IncludeFilter::new(&opts.path, &opts.include)?;
-    let walker = build_walker(opts)?;
+    let walker = build_parallel_walker(opts)?;
 
-    let mut files = Vec::new();
-    for result in walker {
-        let entry = result.context("Failed to read directory entry")?;
-        let path = entry.path();
-        match read_file_entry(path, &opts.path, &include) {
-            Ok(Some(file_entry)) => files.push(file_entry),
-            Ok(None) => continue,
-            Err(err) => return Err(err),
-        }
+    let files: Mutex<Vec<FileEntry>> = Mutex::new(Vec::new());
+    let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+
+    walker.run(|| {
+        let files = &files;
+        let first_err = &first_err;
+        let include = &include;
+        let root = &opts.path;
+
+        Box::new(move |result| {
+            let entry = match result.context("Failed to read directory entry") {
+                Ok(e) => e,
+                Err(err) => {
+                    let mut guard = first_err.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(err);
+                    }
+                    return WalkState::Quit;
+                }
+            };
+
+            // Fast skip directories using DirEntry file_type without extra stat syscall
+            if let Some(ft) = entry.file_type() {
+                if !ft.is_file() {
+                    return WalkState::Continue;
+                }
+            }
+
+            match read_file_entry(entry.path(), root, include) {
+                Ok(Some(file_entry)) => {
+                    files.lock().unwrap().push(file_entry);
+                    WalkState::Continue
+                }
+                Ok(None) => WalkState::Continue,
+                Err(err) => {
+                    let mut guard = first_err.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(err);
+                    }
+                    WalkState::Quit
+                }
+            }
+        })
+    });
+
+    if let Some(err) = first_err.into_inner().unwrap() {
+        return Err(err);
     }
 
-    Ok(files)
+    let mut collected = files.into_inner().unwrap();
+    // Ensure deterministic ordering across threads and filesystems
+    collected.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(collected)
 }
 
 pub fn parse_stdin_paths(input: &str, root: &Path) -> Result<Vec<PathBuf>> {
@@ -87,11 +131,14 @@ pub fn collect_files_from_paths(
     _opts: &WalkOptions,
 ) -> Result<Vec<FileEntry>> {
     let include = IncludeFilter::new(root, &[])?;
-    let mut files = Vec::new();
+    let mut files = Vec::with_capacity(paths.len());
 
     for path in paths {
         if !path.is_file() {
-            return Err(anyhow::anyhow!("File from stdin list was not found: {}", path.display()));
+            return Err(anyhow::anyhow!(
+                "File from stdin list was not found: {}",
+                path.display()
+            ));
         }
 
         match read_file_entry(path, root, &include) {
@@ -111,25 +158,51 @@ pub fn collect_files_from_stdin(opts: &WalkOptions) -> Result<Vec<FileEntry>> {
 }
 
 fn read_file_entry(path: &Path, root: &Path, include: &IncludeFilter) -> Result<Option<FileEntry>> {
-    if !path.is_file() {
-        return Ok(None);
-    }
-
     let relative = path.strip_prefix(root).unwrap_or(path);
+    // Filter by include glob BEFORE making filesystem metadata syscalls
     if !include.matches(relative) {
         return Ok(None);
     }
 
-    if path.metadata()?.len() > MAX_FILE_SIZE {
+    let meta = match path.metadata() {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    if !meta.is_file() {
+        return Ok(None);
+    }
+
+    let len = meta.len();
+    if len > MAX_FILE_SIZE {
         eprintln!("Skipping large file: {}", path.display());
         return Ok(None);
     }
 
-    let bytes = std::fs::read(path)
+    let mut file =
+        File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let cap = len as usize;
+    let mut bytes = Vec::with_capacity(cap);
+
+    // If the file is larger than 8KB, read only the first 8KB to sniff for binary NUL bytes
+    // before reading the remaining up to 492KB from disk.
+    if cap > BINARY_SNIFF_BYTES {
+        let mut sniff_buf = [0u8; BINARY_SNIFF_BYTES];
+        let n = file
+            .read(&mut sniff_buf)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if sniff_buf[..n].contains(&0) {
+            return Ok(None);
+        }
+        bytes.extend_from_slice(&sniff_buf[..n]);
+    }
+
+    file.read_to_end(&mut bytes)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    if is_binary(&bytes) {
+
+    if cap <= BINARY_SNIFF_BYTES && is_binary(&bytes) {
         return Ok(None);
     }
+
     let content = String::from_utf8(bytes)
         .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
 
@@ -139,19 +212,16 @@ fn read_file_entry(path: &Path, root: &Path, include: &IncludeFilter) -> Result<
     }))
 }
 
-/// Excludes are installed as override rules so the walker prunes matching
-/// directories during traversal instead of visiting (and reading) their contents.
-/// In override syntax a leading `!` means "ignore".
 fn validate_glob_pattern(pattern: &str, label: &str) -> Result<()> {
-    let open = pattern.matches('[').count();
-    let close = pattern.matches(']').count();
+    let open = pattern.bytes().filter(|&b| b == b'[').count();
+    let close = pattern.bytes().filter(|&b| b == b']').count();
     if open != close {
         return Err(anyhow::anyhow!("Invalid {label} pattern: {pattern:?}"));
     }
     Ok(())
 }
 
-fn build_walker(opts: &WalkOptions) -> Result<Walk> {
+fn build_parallel_walker(opts: &WalkOptions) -> Result<WalkParallel> {
     let mut overrides = OverrideBuilder::new(&opts.path);
     for pattern in &opts.exclude {
         validate_glob_pattern(pattern, "exclude")?;
@@ -159,7 +229,9 @@ fn build_walker(opts: &WalkOptions) -> Result<Walk> {
             .add(&format!("!{pattern}"))
             .with_context(|| format!("Invalid exclude pattern: {pattern:?}"))?;
     }
-    let overrides = overrides.build().context("Failed to compile exclude patterns")?;
+    let overrides = overrides
+        .build()
+        .context("Failed to compile exclude patterns")?;
 
     let mut builder = WalkBuilder::new(&opts.path);
     builder
@@ -169,14 +241,9 @@ fn build_walker(opts: &WalkOptions) -> Result<Walk> {
         .git_exclude(opts.respect_gitignore)
         .require_git(false);
 
-    Ok(builder.build())
+    Ok(builder.build_parallel())
 }
 
-/// Include patterns are applied as a post-filter on files, not as override
-/// whitelists. A whitelist override takes precedence over `.gitignore` and
-/// would resurrect ignored files whenever `--include` is used; that is not
-/// what `--include "*.rs"` should mean. Since an include pattern can never
-/// prune a directory, filtering after the walk costs nothing extra.
 struct IncludeFilter(Option<Gitignore>);
 
 impl IncludeFilter {
@@ -191,13 +258,12 @@ impl IncludeFilter {
                 .add_line(None, pattern)
                 .with_context(|| format!("Invalid include pattern: {pattern:?}"))?;
         }
-        let matcher = builder.build().context("Failed to compile include patterns")?;
+        let matcher = builder
+            .build()
+            .context("Failed to compile include patterns")?;
         Ok(Self(Some(matcher)))
     }
 
-    /// `relative` must be relative to the scan root. A file matches if it or
-    /// any parent directory matches a pattern, so `--include src` selects
-    /// everything under `src/`.
     fn matches(&self, relative: &Path) -> bool {
         match &self.0 {
             None => true,
@@ -207,6 +273,7 @@ impl IncludeFilter {
 }
 
 /// Heuristic: a NUL byte in the first 8KB means binary.
+#[inline]
 fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0)
 }
@@ -253,8 +320,18 @@ mod tests {
         assert_eq!(paths(&files), ["a.rs", "b.txt"]);
     }
 
-    /// Regression: a bare directory name never matched the old per-file matcher,
-    /// so `--exclude target` still included everything under `target/`.
+    #[test]
+    fn skips_large_binary_file_via_early_sniff() {
+        let dir = TempDir::new().unwrap();
+        write(&dir, "keep.rs", "fn main() {}");
+        let mut large_bin = vec![b'a'; 32 * 1024];
+        large_bin[100] = 0; // NUL byte in first 8KB
+        write(&dir, "asset.bin", large_bin);
+
+        let files = collect_files(&opts(&dir)).unwrap();
+        assert_eq!(paths(&files), ["keep.rs"]);
+    }
+
     #[test]
     fn exclude_prunes_directories_and_files() {
         let dir = TempDir::new().unwrap();
@@ -284,13 +361,15 @@ mod tests {
         let files = collect_files(&o).unwrap();
         assert_eq!(
             paths(&files),
-            ["README.md", "docs/guide.md", "src/main.rs", "src/util/helper.rs"]
+            [
+                "README.md",
+                "docs/guide.md",
+                "src/main.rs",
+                "src/util/helper.rs"
+            ]
         );
     }
 
-    /// Documents the design choice: includes narrow the selection but do not
-    /// override `.gitignore`. Also covers `require_git(false)` (no repo here)
-    /// and the `respect_gitignore` switch.
     #[test]
     fn include_does_not_override_gitignore() {
         let dir = TempDir::new().unwrap();
@@ -330,7 +409,10 @@ mod tests {
         let root = Path::new(".");
         let input = "\n# comment\nsrc/main.rs\n./README.md\n\n";
         let paths = parse_stdin_paths(input, root).unwrap();
-        assert_eq!(paths, [PathBuf::from("src/main.rs"), PathBuf::from("README.md")]);
+        assert_eq!(
+            paths,
+            [PathBuf::from("src/main.rs"), PathBuf::from("README.md")]
+        );
     }
 
     #[test]

@@ -1,29 +1,32 @@
+pub mod budget;
 pub mod cli;
-pub mod walker;
+pub mod dependency;
 pub mod formatter;
 pub mod token;
 pub mod tree;
-pub mod budget;
-pub mod dependency;
 pub mod version;
+pub mod walker;
 
 use anyhow::Result;
-use cli::Cli;
-use walker::WalkOptions;
 use budget::PriorityStrategy;
+use cli::Cli;
 use std::collections::HashSet;
+use std::io::{self, Write};
+use walker::WalkOptions;
 
 fn normalize_entry_point(entry_point: &std::path::Path, scan_root: &std::path::Path) -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+
     let base = if scan_root.is_absolute() {
         scan_root.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()).join(scan_root)
+        cwd.join(scan_root)
     };
 
     let absolute_entry = if entry_point.is_absolute() {
         entry_point.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()).join(entry_point)
+        cwd.join(entry_point)
     };
 
     absolute_entry
@@ -37,11 +40,12 @@ fn normalize_entry_point(entry_point: &std::path::Path, scan_root: &std::path::P
 pub fn run(cli: Cli) -> Result<()> {
     eprintln!("{}", version::app_banner());
 
-    let strategy = PriorityStrategy::from_str(&cli.priority)
-        .ok_or_else(|| anyhow::anyhow!(
+    let strategy = PriorityStrategy::from_str(&cli.priority).ok_or_else(|| {
+        anyhow::anyhow!(
             "Invalid priority strategy: '{}'. Valid options: first-come, smallest-first, shallow-first, deep-first",
             cli.priority
-        ))?;
+        )
+    })?;
 
     let walk_opts = WalkOptions::from_cli(&cli);
     let mut files = if cli.stdin_list {
@@ -60,12 +64,8 @@ pub fn run(cli: Cli) -> Result<()> {
             ));
         }
 
-        let file_data: Vec<(String, String)> = files
-            .iter()
-            .map(|f| (f.path.clone(), f.content.clone()))
-            .collect();
-
-        let graph = dependency::build_dependency_graph(&file_data, &cli.path)?;
+        // Pass `&files` directly without cloning file paths or contents
+        let graph = dependency::build_dependency_graph(&files, &cli.path)?;
         let mut relevant = HashSet::new();
         relevant.insert(entry_point_rel.clone());
         relevant.extend(graph.get_dependencies(&entry_point_rel, cli.dep_depth));
@@ -76,13 +76,9 @@ pub fn run(cli: Cli) -> Result<()> {
 
         files.retain(|f| relevant.contains(&f.path));
     }
-    
-    let budget_result = budget::apply_budget(
-        files,
-        cli.max_tokens,
-        strategy,
-        token::estimate_tokens,
-    );
+
+    let budget_result =
+        budget::apply_budget(files, cli.max_tokens, strategy, token::estimate_tokens);
 
     if cli.show_excluded && !budget_result.excluded.is_empty() {
         eprintln!("\nExcluded files (token budget exceeded):");
@@ -98,46 +94,54 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 
     let mut output = String::new();
-    
-    // Add tree if requested (only show included files)
+
+    // Add tree if requested using borrowed &str references (zero String clones)
     if cli.tree {
-        let file_paths: Vec<String> = budget_result
+        let file_paths: Vec<&str> = budget_result
             .included
             .iter()
-            .map(|(f, _)| f.path.clone())
+            .map(|(f, _)| f.path.as_str())
             .collect();
         output.push_str(&tree::generate_tree(&file_paths));
     }
-    
-    // Add formatted file contents
-    output.push_str(&formatter::format_files(&budget_result.included, cli.format)?);
-    
+
+    // Stream formatted file contents directly into `output`
+    formatter::format_files_into(&budget_result.included, cli.format, &mut output)?;
+
     if cli.clipboard {
         #[cfg(not(test))]
         {
             use arboard::Clipboard;
             let mut clipboard = Clipboard::new()?;
             clipboard.set_text(&output)?;
-            eprintln!("Copied to clipboard ({} tokens)", budget_result.total_tokens);
+            eprintln!(
+                "Copied to clipboard ({} tokens)",
+                budget_result.total_tokens
+            );
         }
     }
-    
+
     if let Some(path) = cli.output {
         std::fs::write(&path, &output)?;
-        eprintln!("Written to {} ({} tokens)", path.display(), budget_result.total_tokens);
+        eprintln!(
+            "Written to {} ({} tokens)",
+            path.display(),
+            budget_result.total_tokens
+        );
     } else if !cli.clipboard {
-        print!("{}", output);
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(output.as_bytes())?;
     }
-    
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
     use std::path::Path;
+    use tempfile::TempDir;
 
     #[test]
     fn test_entry_point_normalization_for_scan_root() {
@@ -151,7 +155,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file1 = dir.path().join("test.rs");
         fs::write(&file1, "fn main() {}").unwrap();
-        
+
         let cli = Cli {
             path: dir.path().to_path_buf(),
             include: vec![],
@@ -169,7 +173,7 @@ mod tests {
             dep_depth: 3,
             with_dependents: false,
         };
-        
+
         let result = run(cli);
         assert!(result.is_ok());
     }
@@ -177,7 +181,7 @@ mod tests {
     #[test]
     fn test_invalid_priority_strategy() {
         let dir = TempDir::new().unwrap();
-        
+
         let cli = Cli {
             path: dir.path().to_path_buf(),
             include: vec![],
@@ -195,10 +199,15 @@ mod tests {
             dep_depth: 3,
             with_dependents: false,
         };
-        
+
         let result = run(cli);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid priority strategy"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid priority strategy")
+        );
     }
 
     #[test]
@@ -208,13 +217,13 @@ mod tests {
         fs::create_dir(&src_dir).unwrap();
         fs::write(src_dir.join("main.rs"), "fn main() {}").unwrap();
         fs::write(src_dir.join("lib.rs"), "pub fn foo() {}").unwrap();
-        
+
         let tests_dir = dir.path().join("tests");
         fs::create_dir(&tests_dir).unwrap();
         fs::write(tests_dir.join("test.rs"), "#[test] fn it_works() {}").unwrap();
-        
+
         let output_file = dir.path().join("output.txt");
-        
+
         let cli = Cli {
             path: dir.path().to_path_buf(),
             include: vec![],
@@ -232,10 +241,10 @@ mod tests {
             dep_depth: 3,
             with_dependents: false,
         };
-        
+
         let result = run(cli);
         assert!(result.is_ok());
-        
+
         let output_content = fs::read_to_string(&output_file).unwrap();
         assert!(output_content.contains("Directory structure:"));
         assert!(output_content.contains("src/"));
@@ -251,9 +260,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("large.rs"), "x".repeat(1000)).unwrap();
         fs::write(dir.path().join("small.rs"), "x").unwrap();
-        
+
         let output_file = dir.path().join("output.txt");
-        
+
         let cli = Cli {
             path: dir.path().to_path_buf(),
             include: vec![],
@@ -271,9 +280,9 @@ mod tests {
             dep_depth: 3,
             with_dependents: false,
         };
-        
+
         run(cli).unwrap();
-        
+
         let output_content = fs::read_to_string(&output_file).unwrap();
         assert!(output_content.contains("small.rs"));
         assert!(!output_content.contains("large.rs"));
@@ -284,9 +293,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("included.rs"), "x".repeat(10)).unwrap();
         fs::write(dir.path().join("excluded.rs"), "x".repeat(1000)).unwrap();
-        
+
         let output_file = dir.path().join("output.txt");
-        
+
         let cli = Cli {
             path: dir.path().to_path_buf(),
             include: vec![],
@@ -304,9 +313,9 @@ mod tests {
             dep_depth: 3,
             with_dependents: false,
         };
-        
+
         run(cli).unwrap();
-        
+
         let output_content = fs::read_to_string(&output_file).unwrap();
         let tree_section = output_content.split("===").next().unwrap();
         assert!(tree_section.contains("included.rs"));
