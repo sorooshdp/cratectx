@@ -50,6 +50,8 @@ fn path_depth(path: &str) -> usize {
     path.bytes().filter(|&b| b == b'/' || b == b'\\').count()
 }
 
+const WRAPPER_TOKEN_OVERHEAD: usize = 6;
+
 /// Apply token budget with prioritization strategy
 pub fn apply_budget(
     files: Vec<FileEntry>,
@@ -85,8 +87,9 @@ pub fn apply_budget(
 
     if let Some(max) = max_tokens {
         for (file, tokens) in file_tokens {
-            if total_tokens.saturating_add(tokens) <= max {
-                total_tokens += tokens;
+            let effective_cost = tokens.saturating_add(WRAPPER_TOKEN_OVERHEAD);
+            if total_tokens.saturating_add(effective_cost) <= max {
+                total_tokens += effective_cost;
                 included.push((file, tokens));
             } else {
                 excluded.push(file);

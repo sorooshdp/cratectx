@@ -161,13 +161,14 @@ impl<'ast> Visit<'ast> for ImportVisitor {
             for item in items {
                 self.visit_item(item);
             }
+        } else {
+            // External module declaration: `mod foo;` or `pub mod foo;`
+            self.imports.push(format!("self::{}", node.ident));
         }
     }
 }
 
 impl ImportVisitor {
-    /// Directly walks `syn::UseTree` without invoking `quote!`, avoiding token stream
-    /// formatting and supporting nested group imports (`use crate::{a::b, c};`).
     fn collect_use_tree(&mut self, tree: &UseTree, prefix: &mut Vec<String>) {
         match tree {
             UseTree::Path(path) => {
@@ -210,21 +211,19 @@ impl ImportVisitor {
     }
 }
 
-/// Pre-indexed lookup structure that turns O(Files) per-import resolution into O(1) lookups.
+/// Pre-indexed lookup structure that accurately maps Rust module paths (`foo/bar`, `foo/bar/mod`)
+/// without false-positive stem collisions on external crates.
 struct ModuleIndex {
-    /// Exact normalized path to original file path
     exact_paths: HashMap<String, String>,
-    /// Suffix without `.rs` (e.g. `api/handler`, `src/api/handler`) to original file path
     suffix_to_path: HashMap<String, String>,
-    /// File stem (e.g. `handler`) to original file path
-    stem_to_path: HashMap<String, String>,
+    local_roots: HashSet<String>,
 }
 
 impl ModuleIndex {
     fn build<F: SourceFile>(files: &[F]) -> Self {
         let mut exact_paths = HashMap::with_capacity(files.len());
-        let mut suffix_to_path = HashMap::with_capacity(files.len() * 2);
-        let mut stem_to_path = HashMap::with_capacity(files.len());
+        let mut suffix_to_path = HashMap::with_capacity(files.len() * 3);
+        let mut local_roots = HashSet::new();
 
         for file in files {
             let orig = file.file_path();
@@ -232,32 +231,39 @@ impl ModuleIndex {
             exact_paths.insert(normalized.clone(), orig.to_string());
 
             let trimmed = strip_rust_extension(&normalized);
-            // Index all trailing slash suffixes so `ends_with("/{suffix}")` is O(1)
-            suffix_to_path
-                .entry(trimmed.to_string())
-                .or_insert_with(|| orig.to_string());
-            for (idx, ch) in trimmed.char_indices() {
-                if ch == '/' {
-                    let sub = &trimmed[idx + 1..];
-                    if !sub.is_empty() {
-                        suffix_to_path
-                            .entry(sub.to_string())
-                            .or_insert_with(|| orig.to_string());
+            // If this is `src/network/mod.rs`, also index it under `src/network` and `network`
+            let mod_trimmed = trimmed.strip_suffix("/mod").unwrap_or(trimmed);
+
+            for candidate in [trimmed, mod_trimmed] {
+                suffix_to_path
+                    .entry(candidate.to_string())
+                    .or_insert_with(|| orig.to_string());
+
+                for (idx, ch) in candidate.char_indices() {
+                    if ch == '/' {
+                        let sub = &candidate[idx + 1..];
+                        if !sub.is_empty() {
+                            suffix_to_path
+                                .entry(sub.to_string())
+                                .or_insert_with(|| orig.to_string());
+                        }
                     }
                 }
             }
 
-            if let Some(stem) = Path::new(&normalized).file_stem().and_then(|s| s.to_str()) {
-                stem_to_path
-                    .entry(stem.to_string())
-                    .or_insert_with(|| orig.to_string());
+            // Record known local module names so bare imports only resolve to local modules
+            let rel_src = mod_trimmed.strip_prefix("src/").unwrap_or(mod_trimmed);
+            if let Some(first_seg) = rel_src.split('/').next() {
+                if !first_seg.is_empty() {
+                    local_roots.insert(first_seg.to_string());
+                }
             }
         }
 
         Self {
             exact_paths,
             suffix_to_path,
-            stem_to_path,
+            local_roots,
         }
     }
 
@@ -267,10 +273,80 @@ impl ModuleIndex {
             return None;
         }
 
-        let segments: Vec<&str> = normalized
-            .trim_start_matches("crate::")
-            .trim_start_matches("self::")
-            .trim_start_matches("super::")
+        let current_norm = current_file.replace('\\', "/");
+        let current_dir = Path::new(&current_norm)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+
+        // 1. Handle relative `self::` or `super::` imports
+        if normalized.starts_with("self::") || normalized.starts_with("super::") {
+            let mut base_dir = Path::new(&current_norm)
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf();
+
+            // In Rust, `mod foo;` inside `src/bar.rs` (not `mod.rs`/`lib.rs`/`main.rs`)
+            // looks in `src/bar/foo.rs` or `src/bar.rs`'s directory.
+            let file_stem = Path::new(&current_norm)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+
+            let mut rest = normalized;
+            if let Some(after_self) = rest.strip_prefix("self::") {
+                rest = after_self;
+                if !matches!(file_stem, "lib" | "main" | "mod") {
+                    let sub_dir = base_dir.join(file_stem);
+                    let first_seg = rest.split("::").next().unwrap_or("");
+                    let sub_candidate = sub_dir
+                        .join(first_seg)
+                        .with_extension("rs")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if let Some(target) = self.exact_paths.get(&sub_candidate) {
+                        return Some(target.clone());
+                    }
+                }
+            } else {
+                while let Some(after_super) = rest.strip_prefix("super::") {
+                    rest = after_super;
+                    if !matches!(file_stem, "lib" | "main" | "mod") {
+                        // First `super::` from `src/a/b.rs` goes to `src/a/` (which is `base_dir`)
+                    } else {
+                        base_dir.pop();
+                    }
+                }
+            }
+
+            let segments: Vec<&str> = rest.split("::").filter(|s| !s.is_empty()).collect();
+            for len in (1..=segments.len()).rev() {
+                let rel_suffix = segments[..len].join("/");
+                let candidate = if base_dir.as_os_str().is_empty() {
+                    rel_suffix.clone()
+                } else {
+                    format!("{}/{}", base_dir.to_string_lossy().replace('\\', "/"), rel_suffix)
+                };
+
+                for probe in [
+                    format!("{candidate}.rs"),
+                    format!("{candidate}/mod.rs"),
+                ] {
+                    if let Some(target) = self.exact_paths.get(&probe) {
+                        return Some(target.clone());
+                    }
+                }
+                if let Some(target) = self.suffix_to_path.get(&candidate) {
+                    return Some(target.clone());
+                }
+            }
+            return None;
+        }
+
+        // 2. Handle `crate::` or bare local module imports
+        let is_crate_prefixed = normalized.starts_with("crate::");
+        let stripped = normalized.trim_start_matches("crate::");
+        let segments: Vec<&str> = stripped
             .split("::")
             .filter(|part| !part.trim().is_empty())
             .collect();
@@ -279,35 +355,31 @@ impl ModuleIndex {
             return None;
         }
 
-        // 1. Check full or partial module path suffix (e.g. `crate::api::routes::handler` -> `api/routes` or `api/routes/handler`)
-        for len in (1..=segments.len()).rev() {
-            let suffix = segments[..len].join("/");
+        // Reject external crate imports (e.g., `serde::de::Error` or `anyhow::Context`)
+        // unless prefixed with `crate::` or starting with a known local root module
+        // (or crate name `cratectx`).
+        let effective_segments = if !is_crate_prefixed {
+            if segments[0] == "cratectx" && segments.len() > 1 {
+                &segments[1..]
+            } else if self.local_roots.contains(segments[0]) {
+                &segments[..]
+            } else {
+                return None;
+            }
+        } else {
+            &segments[..]
+        };
+
+        // Match from longest module path prefix to shortest (e.g. `api::routes::Handler` -> `api/routes`)
+        for len in (1..=effective_segments.len()).rev() {
+            let suffix = effective_segments[..len].join("/");
+            if !current_dir.is_empty() {
+                let scoped = format!("{current_dir}/{suffix}");
+                if let Some(target) = self.suffix_to_path.get(&scoped) {
+                    return Some(target.clone());
+                }
+            }
             if let Some(target) = self.suffix_to_path.get(&suffix) {
-                return Some(target.clone());
-            }
-        }
-
-        // 2. Check file stem match for any segment
-        for &seg in &segments {
-            if let Some(target) = self.stem_to_path.get(seg) {
-                return Some(target.clone());
-            }
-        }
-
-        // 3. Relative `super::` fallback
-        if normalized.starts_with("super::") {
-            let current = Path::new(current_file);
-            let parent = current.parent().unwrap_or_else(|| Path::new("."));
-            let mut candidate = parent.to_path_buf();
-            for &segment in &segments {
-                candidate.push(segment);
-            }
-            let candidate_str = candidate
-                .with_extension("rs")
-                .to_string_lossy()
-                .replace('\\', "/");
-
-            if let Some(target) = self.exact_paths.get(&candidate_str) {
                 return Some(target.clone());
             }
         }
@@ -369,6 +441,250 @@ fn path_to_module_path(file_path: &str, base_path: &Path) -> Vec<String> {
 #[inline]
 fn strip_rust_extension(path: &str) -> &str {
     path.strip_suffix(".rs").unwrap_or(path)
+}
+
+/// Strips `#[cfg(test)]` modules/items and `#[test]` functions from Rust source code
+/// while preserving original formatting and comments.
+pub fn strip_rust_tests(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    let mut copy_from = 0;
+
+    while i < len {
+        // Skip comments and string literals so we never match inside them
+        if let Some(next_i) = skip_non_code(bytes, i) {
+            i = next_i;
+            continue;
+        }
+
+        if bytes[i] == b'#' && is_test_attribute(&source[i..]) {
+            // Backtrack horizontal whitespace on the current line
+            let mut attr_start = i;
+            while attr_start > copy_from
+                && matches!(bytes[attr_start - 1], b' ' | b'\t')
+            {
+                attr_start -= 1;
+            }
+            out.push_str(&source[copy_from..attr_start]);
+
+            // Advance past all consecutive attributes and the annotated item (; or { ... })
+            i = skip_annotated_item(bytes, i);
+            // Also consume a single trailing newline if present
+            if i < len && bytes[i] == b'\r' {
+                i += 1;
+            }
+            if i < len && bytes[i] == b'\n' {
+                i += 1;
+            }
+            copy_from = i;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    out.push_str(&source[copy_from..]);
+    out
+}
+
+/// Replaces Rust function and method bodies `{ ... }` with `{ /* ... */ }`,
+/// keeping signatures, types, traits, structs, and comments intact.
+pub fn collapse_rust_bodies(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    let mut copy_from = 0;
+
+    while i < len {
+        if let Some(next_i) = skip_non_code(bytes, i) {
+            i = next_i;
+            continue;
+        }
+
+        // Detect `fn` keyword at identifier boundary
+        if i + 2 <= len
+            && &bytes[i..i + 2] == b"fn"
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+            && (i + 2 == len || !is_ident_char(bytes[i + 2]))
+        {
+            i += 2;
+            let mut seen_params = false;
+            let mut paren_depth = 0usize;
+            let mut bracket_depth = 0usize;
+
+            while i < len {
+                if let Some(next_i) = skip_non_code(bytes, i) {
+                    i = next_i;
+                    continue;
+                }
+                match bytes[i] {
+                    b'(' => {
+                        paren_depth += 1;
+                        seen_params = true;
+                    }
+                    b')' => paren_depth = paren_depth.saturating_sub(1),
+                    b'[' => bracket_depth += 1,
+                    b']' => bracket_depth = bracket_depth.saturating_sub(1),
+                    b';' if seen_params && paren_depth == 0 && bracket_depth == 0 => {
+                        // Trait method declaration without body
+                        i += 1;
+                        break;
+                    }
+                    b'{' if seen_params && paren_depth == 0 && bracket_depth == 0 => {
+                        // Found start of function body block
+                        out.push_str(&source[copy_from..=i]);
+                        out.push_str(" /* ... */ ");
+                        let close_brace = skip_balanced_braces(bytes, i);
+                        copy_from = close_brace.saturating_sub(1); // keep closing `}`
+                        i = close_brace;
+                        break;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    out.push_str(&source[copy_from..]);
+    out
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn is_test_attribute(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('#') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(inside) = rest.strip_prefix('[') else {
+        return false;
+    };
+    let inside = inside.trim_start();
+    inside.starts_with("cfg(test)")
+        || inside.starts_with("test]")
+        || inside.starts_with("tokio::test")
+}
+
+fn skip_annotated_item(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    while i < len {
+        if let Some(next_i) = skip_non_code(bytes, i) {
+            i = next_i;
+            continue;
+        }
+        match bytes[i] {
+            b';' => return i + 1,
+            b'{' => return skip_balanced_braces(bytes, i),
+            _ => i += 1,
+        }
+    }
+    len
+}
+
+fn skip_balanced_braces(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    let mut depth = 0usize;
+    while i < len {
+        if let Some(next_i) = skip_non_code(bytes, i) {
+            i = next_i;
+            continue;
+        }
+        if bytes[i] == b'{' {
+            depth += 1;
+        } else if bytes[i] == b'}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return i + 1;
+            }
+        }
+        i += 1;
+    }
+    len
+}
+
+/// Skips `//` line comments, `/* */` block comments, `"..."` strings, `r#"..."#` raw strings,
+/// and `'c'` character literals. Returns `Some(new_index)` if skipped.
+fn skip_non_code(bytes: &[u8], i: usize) -> Option<usize> {
+    let len = bytes.len();
+    // Line comment
+    if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+        let mut j = i + 2;
+        while j < len && bytes[j] != b'\n' {
+            j += 1;
+        }
+        return Some(j);
+    }
+    // Block comment (supports nesting)
+    if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+        let mut j = i + 2;
+        let mut depth = 1usize;
+        while j + 1 < len && depth > 0 {
+            if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                depth += 1;
+                j += 2;
+            } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                depth -= 1;
+                j += 2;
+            } else {
+                j += 1;
+            }
+        }
+        return Some(j);
+    }
+    // Raw string literal r"..." or r#"..."#
+    if bytes[i] == b'r' && i + 1 < len && (bytes[i + 1] == b'"' || bytes[i + 1] == b'#') {
+        let mut j = i + 1;
+        let mut hashes = 0usize;
+        while j < len && bytes[j] == b'#' {
+            hashes += 1;
+            j += 1;
+        }
+        if j < len && bytes[j] == b'"' {
+            j += 1;
+            while j < len {
+                if bytes[j] == b'"' && j + hashes < len {
+                    if bytes[j + 1..=j + hashes].iter().all(|&b| b == b'#') {
+                        return Some(j + 1 + hashes);
+                    }
+                }
+                j += 1;
+            }
+            return Some(len);
+        }
+    }
+    // Normal string literal
+    if bytes[i] == b'"' {
+        let mut j = i + 1;
+        while j < len {
+            if bytes[j] == b'\\' {
+                j += 2;
+            } else if bytes[j] == b'"' {
+                return Some(j + 1);
+            } else {
+                j += 1;
+            }
+        }
+        return Some(len);
+    }
+    // Character literal (e.g. `'{'`, `'\\'`) vs lifetime (`'a`)
+    if bytes[i] == b'\'' && i + 2 < len {
+        if bytes[i + 1] == b'\\' && i + 3 < len && bytes[i + 3] == b'\'' {
+            return Some(i + 4);
+        }
+        if bytes[i + 2] == b'\'' {
+            return Some(i + 3);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -445,5 +761,53 @@ mod tests {
         let base = Path::new("/project");
         let result = path_to_module_path("/project/src/api/handler.rs", base);
         assert_eq!(result, vec!["src", "api", "handler"]);
+    }
+
+    #[test]
+    fn test_no_false_positive_stem_collision_on_external_crates() {
+        let files = vec![
+            (
+                "src/main.rs".to_string(),
+                "use serde::de::Error;\nuse anyhow::Context;\nfn main() {}".to_string(),
+            ),
+            ("src/error.rs".to_string(), "pub struct Error;".to_string()),
+            ("src/context.rs".to_string(), "pub struct Context;".to_string()),
+        ];
+
+        let graph = build_dependency_graph(&files, Path::new(".")).unwrap();
+        let deps = graph.get_dependencies("src/main.rs", 2);
+        assert!(deps.is_empty(), "External crates must not match local stems: {deps:?}");
+    }
+
+    #[test]
+    fn test_resolves_mod_declarations_and_mod_rs() {
+        let files = vec![
+            ("src/lib.rs".to_string(), "pub mod network;\npub mod cli;".to_string()),
+            ("src/network/mod.rs".to_string(), "pub fn connect() {}".to_string()),
+            ("src/cli.rs".to_string(), "pub struct Cli;".to_string()),
+        ];
+
+        let graph = build_dependency_graph(&files, Path::new(".")).unwrap();
+        let deps = graph.get_dependencies("src/lib.rs", 1);
+        assert!(deps.contains(&"src/network/mod.rs".to_string()));
+        assert!(deps.contains(&"src/cli.rs".to_string()));
+    }
+
+    #[test]
+    fn test_strip_rust_tests_removes_cfg_test_and_preserves_code() {
+        let src = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_works() {\n        let s = \"}\";\n        assert_eq!(2 + 2, 4);\n    }\n}\n";
+        let stripped = strip_rust_tests(src);
+        assert!(stripped.contains("pub fn add"));
+        assert!(!stripped.contains("mod tests"));
+        assert!(!stripped.contains("it_works"));
+    }
+
+    #[test]
+    fn test_collapse_rust_bodies_keeps_signatures() {
+        let src = "/// Doc comment\npub fn compute(x: usize) -> usize {\n    let y = x * 2;\n    y + 1\n}\n";
+        let collapsed = collapse_rust_bodies(src);
+        assert!(collapsed.contains("/// Doc comment"));
+        assert!(collapsed.contains("pub fn compute(x: usize) -> usize { /* ... */ }"));
+        assert!(!collapsed.contains("let y = x * 2"));
     }
 }

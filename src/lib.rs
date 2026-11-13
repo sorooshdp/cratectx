@@ -77,6 +77,37 @@ pub fn run(cli: Cli) -> Result<()> {
         files.retain(|f| relevant.contains(&f.path));
     }
 
+    // Apply optional Rust source transformations before token estimation and budgeting
+    if cli.strip_tests || cli.signatures_only {
+        for file in &mut files {
+            if file.path.ends_with(".rs") {
+                if cli.strip_tests {
+                    file.content = dependency::strip_rust_tests(&file.content);
+                }
+                if cli.signatures_only {
+                    file.content = dependency::collapse_rust_bodies(&file.content);
+                }
+            }
+        }
+    }
+
+    // Reserve token budget for directory tree if both --tree and --max-tokens are active
+    let effective_max_tokens = match (cli.max_tokens, cli.tree) {
+        (Some(max), true) => {
+            let preview_paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+            let tree_tokens = token::estimate_tokens(&tree::generate_tree(&preview_paths));
+            Some(max.saturating_sub(tree_tokens))
+        }
+        (max, _) => max,
+    };
+
+    let budget_result = budget::apply_budget(
+        files,
+        effective_max_tokens,
+        strategy,
+        token::estimate_tokens,
+    );
+
     let budget_result =
         budget::apply_budget(files, cli.max_tokens, strategy, token::estimate_tokens);
 
@@ -143,6 +174,29 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    fn default_test_cli(path: std::path::PathBuf) -> Cli {
+        Cli {
+            path,
+            include: vec![],
+            exclude: vec![],
+            max_tokens: None,
+            priority: "smallest-first".to_string(),
+            format: formatter::Format::Xml,
+            output: None,
+            clipboard: false,
+            no_gitignore: false,
+            tree: false,
+            stdin_list: false,
+            show_excluded: false,
+            entry_point: None,
+            dep_depth: 3,
+            with_dependents: false,
+            strip_tests: false,
+            signatures_only: false,
+            no_redact: false,
+        }
+    }
+
     #[test]
     fn test_entry_point_normalization_for_scan_root() {
         let scan_root = Path::new("src");
@@ -172,6 +226,9 @@ mod tests {
             entry_point: None,
             dep_depth: 3,
             with_dependents: false,
+            strip_tests: false,
+            signatures_only: false,
+            no_redact: false,
         };
 
         let result = run(cli);
@@ -198,6 +255,9 @@ mod tests {
             entry_point: None,
             dep_depth: 3,
             with_dependents: false,
+            strip_tests: false,
+            signatures_only: false,
+            no_redact: false,
         };
 
         let result = run(cli);
@@ -240,6 +300,9 @@ mod tests {
             entry_point: None,
             dep_depth: 3,
             with_dependents: false,
+            strip_tests: false,
+            signatures_only: false,
+            no_redact: false,
         };
 
         let result = run(cli);
@@ -279,6 +342,9 @@ mod tests {
             entry_point: None,
             dep_depth: 3,
             with_dependents: false,
+            strip_tests: false,
+            signatures_only: false,
+            no_redact: false,
         };
 
         run(cli).unwrap();
@@ -312,6 +378,9 @@ mod tests {
             entry_point: None,
             dep_depth: 3,
             with_dependents: false,
+            strip_tests: false,
+            signatures_only: false,
+            no_redact: false,
         };
 
         run(cli).unwrap();

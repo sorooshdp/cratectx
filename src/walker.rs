@@ -17,6 +17,7 @@ pub struct WalkOptions {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub respect_gitignore: bool,
+    pub redact_secrets: bool,
 }
 
 impl WalkOptions {
@@ -26,6 +27,7 @@ impl WalkOptions {
             include: cli.include.clone(),
             exclude: cli.exclude.clone(),
             respect_gitignore: !cli.no_gitignore,
+            redact_secrets: !cli.no_redact,
         }
     }
 }
@@ -105,16 +107,50 @@ pub fn parse_stdin_paths(input: &str, root: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
 
-        let raw_path = if Path::new(trimmed).is_absolute() {
-            PathBuf::from(trimmed)
+        let candidate = Path::new(trimmed);
+        if candidate.is_absolute() && !candidate.starts_with(root) {
+            return Err(anyhow::anyhow!(
+                "Security error: stdin path '{}' is outside scan root '{}'",
+                trimmed,
+                root.display()
+            ));
+        }
+
+        let raw_path = if candidate.is_absolute() {
+            candidate.to_path_buf()
         } else {
-            root.join(trimmed)
+            root.join(candidate)
         };
 
-        let normalized = raw_path
+        let root_depth = root
             .components()
-            .filter(|component| !matches!(component, Component::CurDir))
-            .collect::<PathBuf>();
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count();
+
+        let mut normalized = PathBuf::new();
+        let mut normal_depth = 0usize;
+
+        for component in raw_path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if normal_depth <= root_depth {
+                        return Err(anyhow::anyhow!(
+                            "Security error: path traversal '{}' escapes scan root '{}'",
+                            trimmed,
+                            root.display()
+                        ));
+                    }
+                    normalized.pop();
+                    normal_depth -= 1;
+                }
+                Component::Normal(part) => {
+                    normalized.push(part);
+                    normal_depth += 1;
+                }
+                other => normalized.push(other.as_os_str()),
+            }
+        }
 
         let key = normalized.to_string_lossy().replace('\\', "/");
         if seen.insert(key) {
@@ -203,8 +239,12 @@ fn read_file_entry(path: &Path, root: &Path, include: &IncludeFilter) -> Result<
         return Ok(None);
     }
 
-    let content = String::from_utf8(bytes)
+    let mut content = String::from_utf8(bytes)
         .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+
+    if redact {
+        content = redact_secrets(&content);
+    }
 
     Ok(Some(FileEntry {
         path: relative.to_string_lossy().replace('\\', "/"),
@@ -278,6 +318,89 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0)
 }
 
+/// Redacts PEM private keys and high-confidence API tokens (AWS, GitHub, OpenAI/Anthropic, Slack).
+pub fn redact_secrets(input: &str) -> String {
+    let mut text = input.to_string();
+
+    // 1. Redact PEM private key blocks
+    while let Some(start) = text.find("-----BEGIN ") {
+        let header_end = text[start..].find("-----").map(|i| start + i + 5);
+        if let Some(h_end) = header_end {
+            if text[start..h_end].contains("PRIVATE KEY") {
+                if let Some(end_marker) = text[h_end..].find("-----END ") {
+                    let tail_start = h_end + end_marker;
+                    if let Some(tail_close) = text[tail_start + 9..].find("-----") {
+                        let full_end = tail_start + 9 + tail_close + 5;
+                        text.replace_range(start..full_end, "[REDACTED_PRIVATE_KEY]");
+                        continue;
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    // 2. Redact known token prefixes (AKIA/ASIA, ghp_/github_pat_, sk-, xoxb-/xoxp-)
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut last = 0;
+
+    while i < bytes.len() {
+        let rem = &text[i..];
+        let prev_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+
+        if prev_ok {
+            let token_match = if (rem.starts_with("AKIA") || rem.starts_with("ASIA"))
+                && rem.len() >= 20
+                && rem.as_bytes()[4..20]
+                    .iter()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            {
+                Some((20, "[REDACTED_AWS_KEY]"))
+            } else if rem.starts_with("ghp_") || rem.starts_with("gho_") || rem.starts_with("ghs_")
+            {
+                let len = 4 + rem[4..]
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphanumeric())
+                    .count();
+                (len >= 36).then_some((len, "[REDACTED_GITHUB_TOKEN]"))
+            } else if rem.starts_with("github_pat_") {
+                let len = 11
+                    + rem[11..]
+                        .bytes()
+                        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                        .count();
+                (len >= 30).then_some((len, "[REDACTED_GITHUB_TOKEN]"))
+            } else if rem.starts_with("sk-") {
+                let len = 3 + rem[3..]
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+                    .count();
+                (len >= 24).then_some((len, "[REDACTED_API_KEY]"))
+            } else {
+                None
+            };
+
+            if let Some((tok_len, replacement)) = token_match {
+                out.push_str(&text[last..i]);
+                out.push_str(replacement);
+                i += tok_len;
+                last = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    if last == 0 {
+        text
+    } else {
+        out.push_str(&text[last..]);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +413,7 @@ mod tests {
             include: vec![],
             exclude: vec![],
             respect_gitignore: true,
+            redact_secrets: true,
         }
     }
 
@@ -429,5 +553,26 @@ mod tests {
         assert!(files.iter().any(|f| f.path == "src/main.rs"));
         assert!(files.iter().any(|f| f.path == "src/lib.rs"));
         assert!(files.iter().any(|f| f.path == "README.md"));
+    }
+
+    #[test]
+    fn stdin_paths_reject_parent_directory_traversal() {
+        let root = Path::new("src");
+        let err = parse_stdin_paths("../secrets.env\n", root)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Security error"), "{err}");
+    }
+
+    #[test]
+    fn redacts_aws_github_openai_and_private_keys() {
+        let sample = "aws = \"AKIAIOSFODNN7EXAMPLE\"\ngh = \"ghp_1234567890abcdefghijklmnopqrstuvwxyz\"\noai = \"sk-proj-1234567890abcdefghijklmnop\"\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----";
+        let clean = redact_secrets(sample);
+        assert!(clean.contains("[REDACTED_AWS_KEY]"));
+        assert!(clean.contains("[REDACTED_GITHUB_TOKEN]"));
+        assert!(clean.contains("[REDACTED_API_KEY]"));
+        assert!(clean.contains("[REDACTED_PRIVATE_KEY]"));
+        assert!(!clean.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!clean.contains("MIIEpAIBAAKCAQEA"));
     }
 }

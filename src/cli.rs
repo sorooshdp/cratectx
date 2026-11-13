@@ -62,9 +62,21 @@ pub struct Cli {
     #[arg(long, default_value = "3")]
     pub dep_depth: usize,
 
-    /// Include reverse dependencies (files that depend on the entry point)
+/// Include reverse dependencies (files that depend on the entry point)
     #[arg(long)]
     pub with_dependents: bool,
+
+    /// Strip #[cfg(test)] modules and #[test] functions from Rust files
+    #[arg(long)]
+    pub strip_tests: bool,
+
+    /// Collapse Rust function bodies to `{ /* ... */ }` to save tokens
+    #[arg(long)]
+    pub signatures_only: bool,
+
+    /// Disable automatic redaction of API keys, tokens, and private keys
+    #[arg(long)]
+    pub no_redact: bool,
 }
 
 #[cfg(test)]
@@ -130,6 +142,20 @@ mod tests {
     fn test_stdin_list_flag() {
         let cli = Cli::try_parse_from(&["cratectx", "--stdin-list"]).unwrap();
         assert!(cli.stdin_list);
+    }
+
+    #[test]
+    fn test_security_and_transform_flags() {
+        let cli = Cli::try_parse_from(&[
+            "cratectx",
+            "--strip-tests",
+            "--signatures-only",
+            "--no-redact",
+        ])
+        .unwrap();
+        assert!(cli.strip_tests);
+        assert!(cli.signatures_only);
+        assert!(cli.no_redact);
     }
 
     #[test]

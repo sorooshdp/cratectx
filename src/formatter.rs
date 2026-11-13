@@ -48,7 +48,7 @@ fn format_xml_into(files: &[(FileEntry, usize)], output: &mut String) -> Result<
         output.push_str("<file path=\"");
         escape_xml_into(&file.path, output);
         let _ = write!(output, "\" tokens=\"{tokens}\">\n");
-        escape_xml_into(&file.content, output);
+        sanitize_xml_body_into(&file.content, output);
         output.push_str("\n</file>\n");
     }
 
@@ -56,13 +56,27 @@ fn format_xml_into(files: &[(FileEntry, usize)], output: &mut String) -> Result<
     Ok(())
 }
 
+/// Preserves raw code symbols (`<`, `>`, `&`, `'`) for token efficiency while escaping
+/// closing `</file>` and `</context>` tags to block tag-breakout prompt injection.
+fn sanitize_xml_body_into(content: &str, out: &mut String) {
+    let sanitized = content
+        .replace("</file>", "&lt;/file&gt;")
+        .replace("</context>", "&lt;/context&gt;");
+    out.push_str(&sanitized);
+}
+
 fn format_markdown_into(files: &[(FileEntry, usize)], output: &mut String) -> Result<()> {
     for (file, tokens) in files {
+        let fence = if file.content.contains("```") {
+            "````"
+        } else {
+            "```"
+        };
         let _ = writeln!(output, "## {}", file.path);
         let _ = writeln!(output, "*({tokens} tokens)*\n");
-        output.push_str("```\n");
+        let _ = writeln!(output, "{fence}");
         output.push_str(&file.content);
-        output.push_str("\n```\n\n");
+        let _ = writeln!(output, "\n{fence}\n");
     }
 
     Ok(())
@@ -190,17 +204,21 @@ mod tests {
     }
 
     #[test]
-    fn test_xml_with_special_chars() {
+    fn test_xml_preserves_rust_syntax_and_blocks_tag_injection() {
         let files = vec![(
             FileEntry {
                 path: "test<>.rs".to_string(),
-                content: "let x = \"<tag>\";".to_string(),
+                content: "fn foo<'a>(x: &'a Vec<i32>) { /* </file></context> */ }".to_string(),
             },
-            5,
+            10,
         )];
         let output = format_files(&files, Format::Xml).unwrap();
 
-        assert!(output.contains("&lt;tag&gt;"));
-        assert!(!output.contains("<tag>"));
+        // Attribute path is still XML-escaped
+        assert!(output.contains("path=\"test&lt;&gt;.rs\""));
+        // Rust generics, borrows, and lifetimes are preserved unescaped
+        assert!(output.contains("fn foo<'a>(x: &'a Vec<i32>)"));
+        // Breakout tags inside content are neutralized
+        assert!(output.contains("&lt;/file&gt;&lt;/context&gt;"));
     }
 }
