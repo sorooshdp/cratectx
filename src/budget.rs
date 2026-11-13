@@ -1,5 +1,5 @@
-use std::cmp::Reverse;
 use crate::walker::FileEntry;
+use std::cmp::Reverse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriorityStrategy {
@@ -50,8 +50,6 @@ fn path_depth(path: &str) -> usize {
     path.bytes().filter(|&b| b == b'/' || b == b'\\').count()
 }
 
-const WRAPPER_TOKEN_OVERHEAD: usize = 6;
-
 /// Apply token budget with prioritization strategy
 pub fn apply_budget(
     files: Vec<FileEntry>,
@@ -87,9 +85,8 @@ pub fn apply_budget(
 
     if let Some(max) = max_tokens {
         for (file, tokens) in file_tokens {
-            let effective_cost = tokens.saturating_add(WRAPPER_TOKEN_OVERHEAD);
-            if total_tokens.saturating_add(effective_cost) <= max {
-                total_tokens += effective_cost;
+            if total_tokens.saturating_add(tokens) <= max {
+                total_tokens += tokens;
                 included.push((file, tokens));
             } else {
                 excluded.push(file);
@@ -228,7 +225,12 @@ mod tests {
     fn test_exact_budget_fit() {
         let files = vec![make_file("a.rs", "xxxx"), make_file("b.rs", "xxxx")];
 
-        let result = apply_budget(files, Some(2), PriorityStrategy::FirstCome, simple_estimator);
+        let result = apply_budget(
+            files,
+            Some(2),
+            PriorityStrategy::FirstCome,
+            simple_estimator,
+        );
 
         assert_eq!(result.included.len(), 2);
         assert_eq!(result.total_tokens, 2);
