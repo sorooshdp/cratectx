@@ -398,6 +398,10 @@ pub fn redact_secrets(input: &str) -> String {
     let mut last = 0;
 
     while i < bytes.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
         let rem = &text[i..];
         let prev_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
 
@@ -654,5 +658,14 @@ mod tests {
 
         let files = collect_files(&opts(&dir)).unwrap();
         assert_eq!(paths(&files), ["src/lib.rs"]);
+    }
+
+    #[test]
+    fn redact_handles_multibyte_chars() {
+        let input = "├── src/\n│   └── lib.rs\n你好 AKIAIOSFODNN7EXAMPLE é";
+        let out = redact_secrets(input);
+        assert!(out.contains("└── lib.rs"));
+        assert!(out.contains("[REDACTED_AWS_KEY]"));
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
     }
 }
