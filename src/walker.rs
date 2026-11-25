@@ -271,8 +271,13 @@ fn read_file_entry(
         return Ok(None);
     }
 
-    let mut content = String::from_utf8(bytes)
-        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+    let mut content = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("Skipping non-UTF-8 file: {}", path.display());
+            return Ok(None);
+        }
+    };
 
     if redact {
         content = redact_secrets(&content);
@@ -667,5 +672,16 @@ mod tests {
         assert!(out.contains("└── lib.rs"));
         assert!(out.contains("[REDACTED_AWS_KEY]"));
         assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn skips_non_utf8_files_instead_of_failing() {
+        let dir = TempDir::new().unwrap();
+        write(&dir, "ok.rs", "fn main() {}");
+        // "café" in Latin-1: 0xE9 is invalid UTF-8 on its own, and there are no NUL bytes
+        write(&dir, "latin1.txt", [b'c', b'a', b'f', 0xE9, b'\n']);
+
+        let files = collect_files(&opts(&dir)).unwrap();
+        assert_eq!(paths(&files), ["ok.rs"]);
     }
 }
